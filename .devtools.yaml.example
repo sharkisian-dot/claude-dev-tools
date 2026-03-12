@@ -48,7 +48,7 @@ gemini:
 hygiene:
   max_rules_lines: 400
 
-# Static analysis gate (deterministic, runs before LLM gates)
+# Static analysis gate (deterministic, runs before LLM gates in relay-race)
 # All commands are optional — only configured commands will run.
 # Commands run on changed files only (git diff --name-only).
 static_analysis:
@@ -60,6 +60,20 @@ static_analysis:
   lint_fix_command: "npx eslint --fix"
   # Formatting auto-fix
   format_command: "npx prettier --write"
+
+# Claude Code hooks — to enforce checks during agent work, add this to
+# .claude/settings.json in your project (runs only after file-write tools):
+#
+#   {
+#     "hooks": [{
+#       "matcher": "stop",
+#       "hooks": [{
+#         "type": "command",
+#         "command": "npx tsc --noEmit",
+#         "on_tools": ["Edit", "Write"]
+#       }]
+#     }]
+#   }
 
 # Project-specific tools registered as plugins
 # plugins:

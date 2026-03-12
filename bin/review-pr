@@ -359,14 +359,6 @@ $(cat "$context_file")" \
   fi
 
   post_review "$pr" "$review_json" "$reviewer_name"
-
-  # Log issues for cross-run pattern detection
-  if [[ "$issue_count" -gt 0 ]]; then
-    local _tmp_json; _tmp_json=$(mktemp)
-    printf '%s' "$review_json" > "$_tmp_json"
-    log_review_issues "review-pr:${reviewer_name}" "PR#${pr}" "$_tmp_json"
-    rm -f "$_tmp_json"
-  fi
 }
 
 # ── Main ─────────────────────────────────────────────────────────────────────

@@ -460,33 +460,33 @@ run_task() {
   prompt="${prompt//\{\{TASK_LINE\}\}/${task_line}}"
 
   echo "  🚀 [${task_id}] Starting" | tee "$log"
-  cost_log_start
+  duration_log_start
 
-  _run_agent() {
-    if [[ "$USE_GEMINI" == true && "$model" != "claude-opus-4-6" ]]; then
-      local stderr_tmp; stderr_tmp=$(mktemp)
-      gemini --yolo --model "$GEMINI_MODEL" --prompt "$prompt" \
-        2>"$stderr_tmp" | tee -a "$log" || {
-        cat "$stderr_tmp" >&2
-        echo "  ⚠️  [${task_id}] Gemini failed — falling back to Claude" | tee -a "$log"
-        env -u CLAUDECODE -u ANTHROPIC_API_KEY claude --dangerously-skip-permissions --model "$model" \
-          -p "$prompt" 2>&1 | tee -a "$log"
-      }
-      rm -f "$stderr_tmp"
-    else
+  if [[ "$USE_GEMINI" == true && "$model" != "claude-opus-4-6" ]]; then
+    local stderr_tmp; stderr_tmp=$(mktemp)
+    gemini --yolo --model "$GEMINI_MODEL" --prompt "$prompt" \
+      2>"$stderr_tmp" | tee -a "$log" || {
+      cat "$stderr_tmp" >&2
+      echo "  ⚠️  [${task_id}] Gemini failed — falling back to Claude" | tee -a "$log"
       env -u CLAUDECODE -u ANTHROPIC_API_KEY claude --dangerously-skip-permissions --model "$model" \
         -p "$prompt" 2>&1 | tee -a "$log"
-    fi
-  }
-
-  # Run agent with one retry on failure (catches transient errors: rate limits, timeouts)
-  if ! _run_agent; then
-    echo "  ⚠️  [${task_id}] Agent failed — retrying in 10s..." | tee -a "$log"
-    sleep 10
-    _run_agent || echo "  ✗ [${task_id}] Retry also failed" | tee -a "$log"
+    }
+    rm -f "$stderr_tmp"
+  else
+    env -u CLAUDECODE -u ANTHROPIC_API_KEY claude --dangerously-skip-permissions --model "$model" \
+      -p "$prompt" 2>&1 | tee -a "$log" || {
+      # Retry once on failure if no done-file was produced (transient error, not partial completion)
+      if [[ ! -f "$done_file" ]]; then
+        echo "  ⚠️  [${task_id}] Agent failed — retrying in 30s..." | tee -a "$log"
+        sleep 30
+        env -u CLAUDECODE -u ANTHROPIC_API_KEY claude --dangerously-skip-permissions --model "$model" \
+          -p "$prompt" 2>&1 | tee -a "$log" || \
+          echo "  ✗ [${task_id}] Retry also failed" | tee -a "$log"
+      fi
+    }
   fi
 
-  cost_log_end "task:${task_id}" "$model"
+  duration_log_end "task:${task_id}" "$model"
 
   # If agent forgot the done-file, write a fallback so the main loop can proceed
   if [[ ! -f "$done_file" ]]; then
@@ -536,11 +536,11 @@ run_task_test_review() {
   prompt="${prompt//\{\{TASK_ID\}\}/${task_id}}"
 
   rm -f "$done_file"
-  cost_log_start
+  duration_log_start
   env -u CLAUDECODE -u ANTHROPIC_API_KEY claude --dangerously-skip-permissions \
     --model claude-sonnet-4-6 \
     -p "$prompt" 2>&1 | tee "$log"
-  cost_log_end "gate:test-review:${task_id}" "claude-sonnet-4-6"
+  duration_log_end "gate:test-review:${task_id}" "claude-sonnet-4-6"
 
   echo ""
   if [[ -f "$done_file" ]]; then
@@ -595,11 +595,11 @@ run_simplify_gate() {
   prompt="${prompt//\{\{NEXT_SC2\}\}/${next_sc2}}"
 
   rm -f "$done_file"
-  cost_log_start
+  duration_log_start
   env -u CLAUDECODE -u ANTHROPIC_API_KEY claude --dangerously-skip-permissions \
     --model claude-haiku-4-5-20251001 \
     -p "$prompt" 2>&1 | tee "$log"
-  cost_log_end "gate:simplify:${task_id}" "claude-haiku-4-5-20251001"
+  duration_log_end "gate:simplify:${task_id}" "claude-haiku-4-5-20251001"
 
   echo ""
   if [[ -f "$done_file" ]]; then
@@ -639,11 +639,11 @@ run_hygiene_gate() {
   prompt="${prompt//\{\{RELAY_BASE_SHA\}\}/${RELAY_BASE_SHA}}"
 
   rm -f "$done_file"
-  cost_log_start
+  duration_log_start
   env -u CLAUDECODE -u ANTHROPIC_API_KEY claude --dangerously-skip-permissions \
     --model claude-haiku-4-5-20251001 \
     -p "$prompt" 2>&1 | tee "$log"
-  cost_log_end "gate:hygiene" "claude-haiku-4-5-20251001"
+  duration_log_end "gate:hygiene" "claude-haiku-4-5-20251001"
 
   echo ""
   if [[ -f "$done_file" ]]; then
@@ -678,11 +678,11 @@ run_review_gate() {
   prompt="${prompt//\{\{RELAY_BASE_SHA\}\}/${RELAY_BASE_SHA}}"
 
   rm -f "$done_file"
-  cost_log_start
+  duration_log_start
   env -u CLAUDECODE -u ANTHROPIC_API_KEY claude --dangerously-skip-permissions \
     --model claude-opus-4-6 \
     -p "$prompt" 2>&1 | tee "$log"
-  cost_log_end "gate:review" "claude-opus-4-6"
+  duration_log_end "gate:review" "claude-opus-4-6"
 
   echo ""
   if [[ -f "$done_file" ]]; then
@@ -726,11 +726,11 @@ run_critique_gate() {
   prompt="${prompt//\{\{RELAY_BASE_SHA\}\}/${RELAY_BASE_SHA}}"
 
   rm -f "$done_file"
-  cost_log_start
+  duration_log_start
   env -u CLAUDECODE -u ANTHROPIC_API_KEY claude --dangerously-skip-permissions \
     --model claude-sonnet-4-6 \
     -p "$prompt" 2>&1 | tee "$log"
-  cost_log_end "gate:critique" "claude-sonnet-4-6"
+  duration_log_end "gate:critique" "claude-sonnet-4-6"
 
   echo ""
   if [[ -f "$done_file" ]]; then
@@ -766,29 +766,37 @@ run_static_analysis_gate() {
   local gate_failed=false
   local fixes_applied=false
 
+  # Build array of existing changed files
+  local format_files=()
+  while IFS= read -r f; do
+    [[ -f "$f" ]] && format_files+=("$f")
+  done <<< "$changed_files"
+
+  # Helper: split command string into array and run with optional file args
+  _run_cmd() {
+    local cmd_str="$1"; shift
+    local cmd_arr
+    read -ra cmd_arr <<< "$cmd_str"
+    "${cmd_arr[@]}" "$@"
+  }
+
   # Step 1: Auto-format changed files (if configured)
-  if [[ -n "$STATIC_ANALYSIS_FORMAT" ]]; then
+  if [[ -n "$STATIC_ANALYSIS_FORMAT" && ${#format_files[@]} -gt 0 ]]; then
     echo "  📐 Formatting..."
-    local format_files=""
-    while IFS= read -r f; do
-      [[ -f "$f" ]] && format_files="$format_files $f"
-    done <<< "$changed_files"
-    if [[ -n "$format_files" ]]; then
-      if eval "$STATIC_ANALYSIS_FORMAT $format_files" 2>/dev/null; then
-        if ! git diff --quiet 2>/dev/null; then
-          fixes_applied=true
-          echo "  ✓ Formatting fixes applied"
-        fi
-      else
-        echo "  ⚠️  Formatter exited with errors (continuing)"
+    if _run_cmd "$STATIC_ANALYSIS_FORMAT" "${format_files[@]}" 2>/dev/null; then
+      if ! git diff --quiet 2>/dev/null; then
+        fixes_applied=true
+        echo "  ✓ Formatting fixes applied"
       fi
+    else
+      echo "  ⚠️  Formatter exited with errors (continuing)"
     fi
   fi
 
   # Step 2: Auto-fix lint issues (if configured)
   if [[ -n "$STATIC_ANALYSIS_LINT_FIX" ]]; then
     echo "  🔧 Auto-fixing lint issues..."
-    if eval "$STATIC_ANALYSIS_LINT_FIX" 2>/dev/null; then
+    if _run_cmd "$STATIC_ANALYSIS_LINT_FIX" 2>/dev/null; then
       if ! git diff --quiet 2>/dev/null; then
         fixes_applied=true
         echo "  ✓ Lint fixes applied"
@@ -807,7 +815,7 @@ run_static_analysis_gate() {
   if [[ -n "$STATIC_ANALYSIS_TYPECHECK" ]]; then
     echo "  🔍 Type checking..."
     local typecheck_output; typecheck_output=$(mktemp)
-    if eval "$STATIC_ANALYSIS_TYPECHECK" > "$typecheck_output" 2>&1; then
+    if _run_cmd "$STATIC_ANALYSIS_TYPECHECK" > "$typecheck_output" 2>&1; then
       echo "  ✓ Type check passed"
     else
       echo "  ✗ Type check failed:"
@@ -823,7 +831,7 @@ run_static_analysis_gate() {
   if [[ -n "$STATIC_ANALYSIS_LINT" ]]; then
     echo "  🔍 Lint check..."
     local lint_output; lint_output=$(mktemp)
-    if eval "$STATIC_ANALYSIS_LINT" > "$lint_output" 2>&1; then
+    if _run_cmd "$STATIC_ANALYSIS_LINT" > "$lint_output" 2>&1; then
       echo "  ✓ Lint check passed"
     else
       echo "  ✗ Lint issues remain:"
@@ -856,7 +864,7 @@ TOTAL_LAUNCHED=0
 RELAY_BASE_SHA=$(git rev-parse HEAD)   # snapshot before any relay commits
 
 # ── Initialize cost tracking ─────────────────────────────────────────────────
-cost_log_init "$LOCK_DIR/cost-report.jsonl"
+duration_log_init "$LOCK_DIR/duration-report.jsonl"
 
 # ── PR mode: create a branch ──────────────────────────────────────────────────
 if [[ "$PR_MODE" == true ]]; then
@@ -1082,7 +1090,7 @@ wait 2>/dev/null || true
 # Cleanup
 rm -rf "$LOCK_DIR"/claim-* "$LOCK_DIR"/*.lock 2>/dev/null || true
 
-# ── Static analysis gate (runs first — deterministic, fast) ──────────────────
+# ── Static analysis gate (deterministic, before LLM gates) ───────────────────
 if [[ "$SKIP_STATIC_ANALYSIS" != true ]]; then
   if [[ -n "$STATIC_ANALYSIS_TYPECHECK" || -n "$STATIC_ANALYSIS_LINT" || -n "$STATIC_ANALYSIS_FORMAT" ]]; then
     run_static_analysis_gate
@@ -1149,81 +1157,90 @@ if [[ "$PR_MODE" == true ]]; then
   echo "📋 Creating pull request..."
   git push -u origin "$RELAY_BRANCH" 2>/dev/null || git push origin "$RELAY_BRANCH"
 
-  # Build PR body with gate result aggregation
-  TASK_COUNT=$(grep -c '^\- \[x\]' "$TASKS_FILE" 2>/dev/null || echo "0")
+  # Build PR body with gate result aggregation (wrapped in a function so local is valid)
+  build_pr_body() {
+    local task_count
+    task_count=$(grep -c '^\- \[x\]' "$TASKS_FILE" 2>/dev/null || echo "0")
 
-  # Collect gate results from done-files
-  _gate_status() {
-    local name="$1" file="$2" skip="$3"
-    if [[ "$skip" == true ]]; then
-      echo "skipped"
-    elif [[ -f "$file" ]]; then
-      head -1 "$file" | cut -c1-100
-    else
-      echo "no result"
-    fi
-  }
+    # Collect gate results from done-files
+    _gate_status() {
+      local file="$1" skip="$2"
+      if [[ "$skip" == true ]]; then echo "skipped"
+      elif [[ -f "$file" ]]; then head -1 "$file" | cut -c1-100
+      else echo "no result"; fi
+    }
 
-  # Collect per-task gate summaries
-  _task_gate_summaries() {
-    local gate_type="$1"
-    for f in "$LOCK_DIR"/${gate_type}-*; do
-      [[ -f "$f" ]] || continue
-      local tid; tid=$(basename "$f" | sed "s/^${gate_type}-//")
-      local result; result=$(head -1 "$f" | cut -c1-80)
-      echo "  - \`${tid}\`: ${result}"
-    done
-  }
+    # Collect per-task gate summaries (anchored to done-* prefix)
+    _task_gate_summaries() {
+      local gate_type="$1"
+      for f in "$LOCK_DIR"/done-${gate_type}-*; do
+        [[ -f "$f" ]] || continue
+        local tid; tid=$(basename "$f" | sed "s/^done-${gate_type}-//")
+        local result; result=$(head -1 "$f" | cut -c1-80)
+        echo "  - \`${tid}\`: ${result}"
+      done
+    }
 
-  PR_BODY="## Relay Run Summary
-- Tasks completed: $TASK_COUNT
+    local body="## Relay Run Summary
+- Tasks completed: ${task_count}
 - Base SHA: \`${RELAY_BASE_SHA:0:7}\`
 
 ## Quality Gates
-- **Static analysis**: $(_gate_status "Static analysis" "$LOCK_DIR/done-STATIC-ANALYSIS" "$SKIP_STATIC_ANALYSIS")
-- **Opus review**: $(_gate_status "Review" "$LOCK_DIR/done-REVIEW" "$SKIP_REVIEW_GATE")
-- **Hygiene**: $(_gate_status "Hygiene" "$LOCK_DIR/done-HYGIENE" "$SKIP_HYGIENE_GATE")
-- **Visual critique**: $(_gate_status "Critique" "$LOCK_DIR/done-CRITIQUE" "$SKIP_CRITIQUE_GATE")
+- **Static analysis**: $(_gate_status "$LOCK_DIR/done-STATIC-ANALYSIS" "$SKIP_STATIC_ANALYSIS")
+- **Opus review**: $(_gate_status "$LOCK_DIR/done-REVIEW" "$SKIP_REVIEW_GATE")
+- **Hygiene**: $(_gate_status "$LOCK_DIR/done-HYGIENE" "$SKIP_HYGIENE_GATE")
+- **Visual critique**: $(_gate_status "$LOCK_DIR/done-CRITIQUE" "$SKIP_CRITIQUE_GATE")
 - **Browser-use**: $(if [[ "$SKIP_BROWSER_GATE" == true ]]; then echo 'skipped'; else echo 'ran'; fi)"
 
-  # Add per-task test review results if any exist
-  local test_summaries; test_summaries=$(_task_gate_summaries "test-review")
-  if [[ -n "$test_summaries" ]]; then
-    PR_BODY+="
+    # Collect detail sections
+    local details=""
+    local test_summaries; test_summaries=$(_task_gate_summaries "test-review")
+    if [[ -n "$test_summaries" ]]; then
+      details+="### Test Review Results
+${test_summaries}
 
-### Test Review Results
-${test_summaries}"
-  fi
+"
+    fi
+    local simplify_summaries; simplify_summaries=$(_task_gate_summaries "simplify")
+    if [[ -n "$simplify_summaries" ]]; then
+      details+="### Code Simplifier Results
+${simplify_summaries}
 
-  # Add per-task simplify results if any exist
-  local simplify_summaries; simplify_summaries=$(_task_gate_summaries "simplify")
-  if [[ -n "$simplify_summaries" ]]; then
-    PR_BODY+="
+"
+    fi
 
-### Code Simplifier Results
-${simplify_summaries}"
-  fi
+    # Duration summary
+    if [[ -f "$LOCK_DIR/duration-report.jsonl" ]]; then
+      local total_dur=0 invocation_count=0
+      while IFS= read -r cline; do
+        local dur; dur=$(printf '%s' "$cline" | jq -r '.duration_s // 0' 2>/dev/null) || continue
+        total_dur=$(( total_dur + dur ))
+        (( invocation_count++ )) || true
+      done < "$LOCK_DIR/duration-report.jsonl"
+      details+="### Duration
+- ${invocation_count} LLM invocations, $(( total_dur / 60 ))m$(( total_dur % 60 ))s total wall time
 
-  # Add cost summary if available
-  if [[ -f "$LOCK_DIR/cost-report.jsonl" ]]; then
-    local total_dur=0 invocation_count=0
-    while IFS= read -r cline; do
-      local dur; dur=$(printf '%s' "$cline" | jq -r '.duration_s // 0' 2>/dev/null) || continue
-      total_dur=$(( total_dur + dur ))
-      (( invocation_count++ )) || true
-    done < "$LOCK_DIR/cost-report.jsonl"
-    local total_min=$(( total_dur / 60 ))
-    local total_sec=$(( total_dur % 60 ))
-    PR_BODY+="
+"
+    fi
 
-### Cost Summary
-- ${invocation_count} LLM invocations, ${total_min}m${total_sec}s total wall time
-- Details: \`${LOCK_DIR}/cost-report.jsonl\`"
-  fi
+    # Wrap details in collapsible section if non-empty
+    if [[ -n "$details" ]]; then
+      body+="
 
-  PR_BODY+="
+<details>
+<summary>Gate Details</summary>
+
+${details}</details>"
+    fi
+
+    body+="
 
 Generated with [Claude Code](https://claude.com/claude-code) relay-race"
+    echo "$body"
+  }
+
+  TASK_COUNT=$(grep -c '^\- \[x\]' "$TASKS_FILE" 2>/dev/null || echo "0")
+  PR_BODY=$(build_pr_body)
 
   PR_URL=$(gh pr create --title "relay: $(date +%Y-%m-%d) — $TASK_COUNT tasks" --body "$PR_BODY" --base main)
   PR_NUMBER=$(basename "$PR_URL")
@@ -1243,4 +1260,4 @@ echo "   Logs: $LOCK_DIR/log-*.txt"
 if [[ "$PR_MODE" == true ]]; then
   echo "   Branch: $RELAY_BRANCH"
 fi
-cost_log_summary
+duration_log_summary

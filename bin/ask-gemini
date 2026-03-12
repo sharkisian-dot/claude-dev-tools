@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# ask-gemini — convenience wrapper for Gemini CLI / SDK
+#
+# Usage:
+#   devtools ask-gemini --file src/lib/foo.ts --prompt "Review for bugs"
+#   devtools ask-gemini --glob "src/app/api/**/route.ts" --prompt "Check compliance"
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../lib/config.sh"
+
+cd "$REPO_ROOT"
+
+GEMINI_TOOL_PATH=$(config_get "gemini.tool_path" "tools/gemini_tool.py")
+GEMINI_REQUIREMENTS=$(config_get "gemini.requirements" "tools/requirements.txt")
+
+# Ensure dependencies are installed (only needed for SDK path)
+if [[ -f "$GEMINI_REQUIREMENTS" ]]; then
+  if ! python3 -c "from google import genai" 2>/dev/null; then
+    echo "Installing google-genai..." >&2
+    pip3 install -q -r "$GEMINI_REQUIREMENTS"
+  fi
+fi
+
+if [[ -f "$GEMINI_TOOL_PATH" ]]; then
+  chmod +x "$GEMINI_TOOL_PATH" 2>/dev/null || true
+  python3 "$GEMINI_TOOL_PATH" "$@"
+else
+  # Fall back to gemini CLI
+  if command -v gemini &>/dev/null; then
+    gemini "$@"
+  else
+    echo "ERROR: No Gemini tool found at $GEMINI_TOOL_PATH and gemini CLI not installed" >&2
+    exit 1
+  fi
+fi

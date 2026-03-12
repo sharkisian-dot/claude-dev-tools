@@ -1,0 +1,1061 @@
+#!/bin/bash
+# Parallel Relay Race — multi-agent task execution with dependency management
+#
+# Tasks run in parallel up to --parallel N. Dependencies block task start.
+# The main loop assigns specific tasks to agents (no "find first unchecked" ambiguity).
+# Agents signal completion via .relay-locks/done-TASKID files.
+#
+# ── Dependency syntax (inline on task line in TASKS.md) ───────────────────────
+#   - [ ] **Task AG-5: [sonnet] Fix bug** [needs: AG-4]
+#   - [ ] **Task AG-6: [sonnet] Other**   [needs: AG-4, AG-5]
+#
+# ── Usage ─────────────────────────────────────────────────────────────────────
+#   relay-race                  # sequential, creates PR (default)
+#   relay-race --parallel 3     # up to 3 concurrent agents
+#   relay-race --no-pr          # commit to current branch, no PR
+#   relay-race --parallel 3 --gemini  # Gemini primary (default: gemini-3.1-pro-preview)
+#   relay-race --parallel 3 --gemini --gemini-model gemini-2.5-pro  # specific model
+#   relay-race --dry-run        # show execution plan
+#   relay-race --max 10         # cap total tasks
+#   relay-race --tasks OTHER.md # use a different task file
+#   relay-race --skip-review    # skip end-of-run Opus review gate
+#   relay-race --skip-critique  # skip end-of-run visual critique gate
+#   relay-race --skip-browser   # skip end-of-run browser-use gate
+#   relay-race --skip-hygiene   # skip end-of-run hygiene gate
+#   relay-race --skip-test-review  # skip per-task testing review gate
+#   relay-race --skip-simplify  # skip per-task Code Simplifier gate
+#   relay-race --strict-conflicts  # serialize tasks sharing files (default: warn only)
+#   relay-race --no-auto-merge  # create PR but don't auto-merge
+#   relay-race --skip-vet          # skip vet-debate review gate
+
+set -eo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+# ── Source devtools libs ───────────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../lib/config.sh"
+source "${SCRIPT_DIR}/../lib/helpers.sh"
+source "${SCRIPT_DIR}/../lib/agents.sh"
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
+MAX_PARALLEL=1
+MAX_TASKS=999
+DRY_RUN=false
+USE_GEMINI=false
+GEMINI_MODEL="gemini-3.1-pro-preview"
+SKIP_REVIEW_GATE=false
+SKIP_CRITIQUE_GATE=false
+SKIP_TEST_REVIEW_GATE=false
+SKIP_SIMPLIFY_GATE=false
+SKIP_HYGIENE_GATE=false
+SKIP_BROWSER_GATE=false
+SKIP_VET_GATE=false
+PR_MODE=true
+AUTO_MERGE=true
+STRICT_CONFLICTS=false
+TASKS_FILE="${RELAY_TASKS_FILE}"
+LOCK_DIR="${RELAY_LOCK_DIR}"
+RELAY_BRANCH=""
+
+# ── Arg parsing ───────────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --parallel|-p)  MAX_PARALLEL="$2"; shift 2 ;;
+    --max)          MAX_TASKS="$2";    shift 2 ;;
+    --dry-run)      DRY_RUN=true;      shift   ;;
+    --gemini)       USE_GEMINI=true;   shift   ;;
+    --gemini-model) GEMINI_MODEL="$2"; shift 2 ;;
+    --skip-review)       SKIP_REVIEW_GATE=true;      shift ;;
+    --skip-critique)     SKIP_CRITIQUE_GATE=true;    shift ;;
+    --skip-test-review)  SKIP_TEST_REVIEW_GATE=true;  shift ;;
+    --skip-simplify)     SKIP_SIMPLIFY_GATE=true;    shift ;;
+    --skip-hygiene)      SKIP_HYGIENE_GATE=true;     shift ;;
+    --skip-browser)      SKIP_BROWSER_GATE=true;     shift ;;
+    --skip-vet)          SKIP_VET_GATE=true;          shift ;;
+    --pr)                PR_MODE=true;                shift ;;
+    --no-pr)             PR_MODE=false;               shift ;;
+    --no-auto-merge)     AUTO_MERGE=false;            shift ;;
+    --strict-conflicts)  STRICT_CONFLICTS=true;       shift ;;
+    --tasks)             TASKS_FILE="$2";             shift 2 ;;
+    -h|--help)
+      sed -n '2,25p' "$0" | grep '^#' | sed 's/^# \?//'
+      exit 0 ;;
+    *) echo "Unknown option: $1  (use --help)"; exit 1 ;;
+  esac
+done
+
+mkdir -p "$LOCK_DIR"
+
+# Auto-clean stale claims (avoids manual rm -rf .relay-locks/claim-* after crashes)
+find "$LOCK_DIR" -name "claim-*" -maxdepth 1 -mmin +120 -exec rm -rf {} + 2>/dev/null || true
+
+# Auto-start dev server if not running (needed for visual verification in tasks)
+# Check configured port and port+1 (fallback if primary is taken)
+_dev_port=""
+_alt_port=$(( DEV_PORT + 1 ))
+for _p in "$DEV_PORT" "$_alt_port"; do
+  if curl -sf --max-time 3 "http://localhost:${_p}" >/dev/null 2>&1; then
+    _dev_port="$_p"
+    break
+  fi
+done
+if [[ -z "$_dev_port" ]]; then
+  echo "⚡ Dev server not detected — starting in background..."
+  nohup ${DEV_COMMAND} > /tmp/dev-server-${DEV_PORT}.log 2>&1 &
+  echo "   Waiting up to 30s for server to be ready..."
+  for i in $(seq 1 30); do
+    sleep 1
+    for _p in "$DEV_PORT" "$_alt_port"; do
+      if curl -sf --max-time 2 "http://localhost:${_p}" >/dev/null 2>&1; then
+        _dev_port="$_p"
+        break 2
+      fi
+    done
+  done
+fi
+if [[ -n "$_dev_port" ]]; then
+  export TEST_BASE_URL="http://localhost:$_dev_port"
+  echo "   ✓ Dev server ready on port $_dev_port (TEST_BASE_URL=$TEST_BASE_URL)"
+fi
+
+# ── Bash version check (4.3+ for wait -n) ────────────────────────────────────
+BASH_MAJOR="${BASH_VERSINFO[0]}"
+BASH_MINOR="${BASH_VERSINFO[1]}"
+HAS_WAIT_N=false
+if (( BASH_MAJOR > 4 || (BASH_MAJOR == 4 && BASH_MINOR >= 3) )); then
+  HAS_WAIT_N=true
+fi
+
+# ── Portable associative array helpers (bash 3.2+) ───────────────────────────
+# Uses parallel indexed arrays instead of declare -A for macOS compatibility.
+_map_pids=()
+_map_tasks=()
+_map_lines=()
+
+_map_set() {
+  local pid="$1" task="$2" line="$3"
+  _map_pids+=("$pid")
+  _map_tasks+=("$task")
+  _map_lines+=("$line")
+}
+
+_map_get_task() {
+  local pid="$1" i
+  for i in "${!_map_pids[@]}"; do
+    [[ "${_map_pids[$i]}" == "$pid" ]] && echo "${_map_tasks[$i]}" && return
+  done
+}
+
+_map_get_line() {
+  local pid="$1" i
+  for i in "${!_map_pids[@]}"; do
+    [[ "${_map_pids[$i]}" == "$pid" ]] && echo "${_map_lines[$i]}" && return
+  done
+}
+
+_map_del() {
+  local pid="$1" i
+  for i in "${!_map_pids[@]}"; do
+    if [[ "${_map_pids[$i]}" == "$pid" ]]; then
+      unset '_map_pids[i]' '_map_tasks[i]' '_map_lines[i]'
+      return
+    fi
+  done
+}
+
+_map_pids_list() { echo "${_map_pids[@]}"; }
+_map_size() { echo "${#_map_pids[@]}"; }
+_map_tasks_list() { echo "${_map_tasks[@]}"; }
+
+# ── Task parsing helpers ───────────────────────────────────────────────────────
+
+task_id_of() {
+  # Matches AG-4, BT-1, SC-1, SC-BT-6-1, P0-3A, P0-3B — uppercase letters/digits/hyphens ending in digit or letter
+  echo "$1" | sed -n 's/.*Task \([A-Z][A-Z0-9-]*[A-Z0-9]\).*/\1/p' | head -1 || true
+}
+
+# Validate task format before starting — catch malformed lines early
+while IFS= read -r line; do
+  [[ "$line" =~ ^\-\ \[\ \] ]] || continue
+  tid=$(task_id_of "$line")
+  if [[ -z "$tid" ]]; then
+    echo "⚠️  Unparseable task line (no valid Task ID found):"
+    echo "    $line"
+    echo "    Expected format: - [ ] **Task XX-1: [model] Title**"
+  fi
+done < "$TASKS_FILE"
+
+model_of() {
+  if echo "$1" | grep -q '\[haiku\]'; then echo "claude-haiku-4-5-20251001"
+  elif echo "$1" | grep -q '\[opus\]'; then echo "claude-opus-4-6"
+  else echo "claude-sonnet-4-6"
+  fi
+}
+
+model_label_of() {
+  if echo "$1" | grep -q '\[haiku\]'; then echo "Haiku"
+  elif echo "$1" | grep -q '\[opus\]'; then echo "Opus"
+  else echo "Sonnet"
+  fi
+}
+
+# Returns newline-separated dep IDs from "[needs: AG-3, AG-4]" on a task line
+deps_of() {
+  echo "$1" | sed -n 's/.*\[needs:[[:space:]]*\([^]]*\)\].*/\1/p' | tr ',' '\n' | tr -d ' \t' | grep -v '^$' || true
+}
+
+# Returns 0 if all deps are satisfied.
+# deps_satisfied "task line"              — checks TASKS_FILE only
+# deps_satisfied "task line" "T1 T2 T3"  — also counts space-separated virtual IDs as done
+deps_satisfied() {
+  local line="$1"
+  local virtual_done_str="${2:-}"
+  local dep
+  while IFS= read -r dep; do
+    [[ -z "$dep" ]] && continue
+    # Check virtual done string first (fast, no file I/O)
+    if [[ -n "$virtual_done_str" ]] && echo " $virtual_done_str " | grep -q " $dep "; then
+      continue
+    fi
+    # Check the actual TASKS_FILE
+    if ! grep -q "^\- \[x\].*Task[[:space:]]*${dep}" "$TASKS_FILE" 2>/dev/null; then
+      return 1
+    fi
+  done < <(deps_of "$line")
+  return 0
+}
+
+# ── Claim mechanism (atomic mkdir prevents double-start) ─────────────────────
+claim()    { mkdir "$LOCK_DIR/claim-$1" 2>/dev/null; }
+unclaim()  { rm -rf "$LOCK_DIR/claim-$1"; }
+is_claimed() { [[ -d "$LOCK_DIR/claim-$1" ]]; }
+
+# ── Wave conflict detection helpers ───────────────────────────────────────────
+
+# Returns the lines of a task's description body (lines after the task header
+# until the next task line or end of file).
+get_task_body() {
+  local task_id="$1"
+  awk "/\bTask[[:space:]]+${task_id}\b/{found=1; next} found && /^\- \[.?\]/{exit} found{print}" "$TASKS_FILE"
+}
+
+# Extracts likely file path mentions from a body of text.
+# Matches common source directory patterns; projects can adjust via .devtools/agents overrides.
+extract_file_paths() {
+  echo "$1" | grep -oE '(src|scripts|supabase|browser-tests|e2e|docs|lib|test|tests|spec|app|pages|components)/[^ ,`'"'"'")\]]+' | sort -u
+}
+
+# Returns 1 (conflict) if the candidate task shares file paths with any running task.
+# Prints a warning message when overlap is found.
+check_wave_conflict() {
+  local candidate_id="$1"
+  shift
+  local running_ids=("$@")   # remaining args are running task IDs
+
+  local candidate_body; candidate_body=$(get_task_body "$candidate_id")
+  local candidate_paths; candidate_paths=$(extract_file_paths "$candidate_body")
+  [[ -z "$candidate_paths" ]] && return 0   # no paths → no conflict possible
+
+  for running_id in "${running_ids[@]}"; do
+    local running_body; running_body=$(get_task_body "$running_id")
+    local running_paths; running_paths=$(extract_file_paths "$running_body")
+    local overlap
+    overlap=$(comm -12 <(echo "$candidate_paths" | sort) <(echo "$running_paths" | sort))
+    if [[ -n "$overlap" ]]; then
+      echo "  ⚠️  [${candidate_id}] File conflict with [${running_id}]:"
+      echo "$overlap" | while read -r p; do echo "       - $p"; done
+      return 1
+    fi
+  done
+  return 0
+}
+
+# ── Portable file locking (macOS + Linux) ────────────────────────────────────
+# Uses mkdir for atomic locking (works on both platforms).
+# Usage: acquire_lock <name> <timeout_secs>; ...; release_lock <name>
+acquire_lock() {
+  local name="$1" timeout="${2:-600}" lockdir="$LOCK_DIR/${name}.lock"
+  local waited=0
+  while ! mkdir "$lockdir" 2>/dev/null; do
+    sleep 1
+    waited=$(( waited + 1 ))
+    if [[ "$waited" -ge "$timeout" ]]; then
+      echo "  ⚠️  Lock timeout on ${name} — breaking stale lock" >&2
+      rmdir "$lockdir" 2>/dev/null || true
+      mkdir "$lockdir" 2>/dev/null || return 1
+      break
+    fi
+  done
+}
+release_lock() {
+  rmdir "$LOCK_DIR/${1}.lock" 2>/dev/null || true
+}
+
+# ── Serialized git commit ─────────────────────────────────────────────────────
+do_commit() {
+  local desc="$1"
+  acquire_lock "git-commit" 120
+  git add -A
+  if [[ -n "$(git diff --cached --name-only 2>/dev/null)" ]]; then
+    SKIP_REVIEW=1 git commit -m "feat: relay - ${desc:0:72}" \
+      && echo "  💾 Committed" \
+      || echo "  ⚠️  Commit failed (retry on next run)"
+  fi
+  release_lock "git-commit"
+}
+
+# ── Serialized TASKS.md update ────────────────────────────────────────────────
+mark_done() {
+  local task_id="$1"
+  # Truncate note to one line so it doesn't corrupt TASKS.md structure
+  local note
+  note=$(echo "${2:-completed}" | head -1 | cut -c1-120)
+  acquire_lock "tasks-write" 60
+  # Pass bash vars via env; use single-quoted Perl so $1/$2 are Perl capture groups
+  RELAY_TASK_ID="$task_id" RELAY_NOTE="$note" perl -i -0777 -pe '
+    my ($tid, $note) = ($ENV{RELAY_TASK_ID}, $ENV{RELAY_NOTE});
+    s{^(- )\[ \]( \*\*Task \Q$tid\E\b)}{$1\[x\]$2  ✓ $note}m;
+  ' "$TASKS_FILE"
+  release_lock "tasks-write"
+}
+
+# ── Serialized TASKS.md update — mark as scout-blocked (needs human decision) ─
+mark_blocked() {
+  local task_id="$1"
+  # Truncate decision to one line so it doesn't corrupt TASKS.md structure
+  local decision
+  decision=$(echo "${2:-decision needed}" | head -1 | cut -c1-160)
+  acquire_lock "tasks-write" 60
+  RELAY_TASK_ID="$task_id" RELAY_DECISION="$decision" perl -i -0777 -pe '
+    my ($tid, $dec) = ($ENV{RELAY_TASK_ID}, $ENV{RELAY_DECISION});
+    s{^(- )\[ \]( \*\*Task \Q$tid\E\b[^\n]*)}{$1[B]$2\n  > 🛑 BLOCKED: $dec}m;
+  ' "$TASKS_FILE"
+  release_lock "tasks-write"
+  # Append to run-level blocked summary for final report
+  echo "[$task_id] $decision" >> "$LOCK_DIR/BLOCKED-SUMMARY.txt"
+}
+
+# ── DRY-RUN: show execution plan ──────────────────────────────────────────────
+show_dry_run_plan() {
+  local vdone_str=""   # space-separated IDs of virtually completed tasks
+  local wave=1
+  local total=0
+
+  echo "📋 Execution plan (--parallel ${MAX_PARALLEL}):"
+  [[ "$STRICT_CONFLICTS" == true ]] && echo "   conflict mode: strict (serialize on file overlap)"
+
+  while true; do
+    # Find all tasks runnable in this wave
+    local wave_tasks=()
+    while IFS= read -r line; do
+      [[ "$line" =~ ^\-\ \[\ \] ]] || continue
+      local tid; tid=$(task_id_of "$line")
+      [[ -z "$tid" ]] && continue
+      # Skip if already planned
+      echo " $vdone_str " | grep -q " $tid " && continue
+      # Check deps against virtual done string
+      deps_satisfied "$line" "$vdone_str" || continue
+      wave_tasks+=("$tid|$line")
+    done < "$TASKS_FILE"
+
+    [[ ${#wave_tasks[@]} -eq 0 ]] && break
+
+    echo ""
+    if (( ${#wave_tasks[@]} > MAX_PARALLEL )); then
+      echo "Wave $wave  (${#wave_tasks[@]} ready, ${MAX_PARALLEL} slots — rest spill to next wave):"
+    else
+      echo "Wave $wave  (${#wave_tasks[@]} in parallel):"
+    fi
+
+    local slot=0
+    for entry in "${wave_tasks[@]}"; do
+      local tid="${entry%%|*}"
+      local tline="${entry#*|}"
+      local label; label=$(model_label_of "$tline")
+      local deps; deps=$(deps_of "$tline" | tr '\n' ', ' | sed 's/,\s*$//')
+      if (( slot < MAX_PARALLEL )); then
+        echo "  [$tid] ($label)$([ -n "$deps" ] && echo " ← needs: $deps")"
+      else
+        echo "  [$tid] ($label) ← spills to wave $((wave+1))"
+      fi
+      vdone_str="$vdone_str $tid"
+      (( total++ )) || true
+      (( slot++ )) || true
+    done
+
+    (( wave++ )) || true
+  done
+
+  # Find dep-unreachable tasks (circular / unsatisfied deps)
+  local dep_blocked=0
+  while IFS= read -r line; do
+    [[ "$line" =~ ^\-\ \[\ \] ]] || continue
+    local tid; tid=$(task_id_of "$line")
+    echo " $vdone_str " | grep -q " $tid " && continue
+    (( dep_blocked++ )) || true
+    local deps; deps=$(deps_of "$line" | tr '\n' ', ' | sed 's/,\s*$//')
+    echo "  ⛔ [$tid] dep-blocked — needs: ${deps:-none}"
+  done < "$TASKS_FILE"
+
+  # Find scout-blocked tasks from a previous run ([B] marker)
+  local scout_blocked=0
+  while IFS= read -r line; do
+    [[ "$line" =~ ^\-\ \[B\] ]] || continue
+    local tid; tid=$(task_id_of "$line")
+    [[ -z "$tid" ]] && continue
+    (( scout_blocked++ )) || true
+    echo "  🛑 [$tid] SCOUT-BLOCKED (needs human decision — see task body)"
+  done < "$TASKS_FILE"
+
+  echo ""
+  local blocked_note=""
+  (( dep_blocked > 0 ))   && blocked_note="${blocked_note}, $dep_blocked dep-blocked"
+  (( scout_blocked > 0 )) && blocked_note="${blocked_note}, $scout_blocked scout-blocked"
+  echo "Total: $total tasks across $((wave - 1)) wave(s)${blocked_note}"
+
+  if [[ "$SKIP_TEST_REVIEW_GATE" != true ]]; then
+    echo ""
+    echo "  [TEST REVIEW] (Sonnet) ← runs async after each commit, adds missing tests (non-blocking)"
+  fi
+  if [[ "$SKIP_REVIEW_GATE" != true ]]; then
+    echo ""
+    echo "  [REVIEW GATE] (Opus) ← runs after all tasks, fixes violations in-place"
+  fi
+  if [[ "$SKIP_HYGIENE_GATE" != true ]]; then
+    echo ""
+    echo "  [HYGIENE GATE] (Haiku) ← checks rules file size, doc clutter, broken refs"
+  fi
+  if [[ "$SKIP_CRITIQUE_GATE" != true ]]; then
+    echo ""
+    echo "  [CRITIQUE GATE] (Sonnet vision) ← screenshots UI pages, flags P1/P2 regressions"
+  fi
+}
+
+if [[ "$DRY_RUN" == true ]]; then
+  echo "🏁 Parallel Relay Race (DRY RUN)"
+  echo "   parallel: ${MAX_PARALLEL}  |  file: ${TASKS_FILE}"
+  echo ""
+  show_dry_run_plan
+  exit 0
+fi
+
+# ── Agent runner (called as background subshell) ───────────────────────────────
+run_task() {
+  local task_id="$1"
+  local task_line="$2"
+  local model="$3"
+  local log="$LOCK_DIR/log-${task_id}.txt"
+  local done_file="$LOCK_DIR/done-${task_id}"
+
+  local prompt
+  prompt=$(load_agent "relay-task-runner")
+  prompt="${prompt//\{\{TASK_ID\}\}/${task_id}}"
+  prompt="${prompt//\{\{TASK_LINE\}\}/${task_line}}"
+
+  echo "  🚀 [${task_id}] Starting" | tee "$log"
+
+  if [[ "$USE_GEMINI" == true && "$model" != "claude-opus-4-6" ]]; then
+    local stderr_tmp; stderr_tmp=$(mktemp)
+    gemini --yolo --model "$GEMINI_MODEL" --prompt "$prompt" \
+      2>"$stderr_tmp" | tee -a "$log" || {
+      cat "$stderr_tmp" >&2
+      echo "  ⚠️  [${task_id}] Gemini failed — falling back to Claude" | tee -a "$log"
+      env -u CLAUDECODE -u ANTHROPIC_API_KEY claude --dangerously-skip-permissions --model "$model" \
+        -p "$prompt" 2>&1 | tee -a "$log"
+    }
+    rm -f "$stderr_tmp"
+  else
+    env -u CLAUDECODE -u ANTHROPIC_API_KEY claude --dangerously-skip-permissions --model "$model" \
+      -p "$prompt" 2>&1 | tee -a "$log"
+  fi
+
+  # If agent forgot the done-file, write a fallback so the main loop can proceed
+  if [[ ! -f "$done_file" ]]; then
+    echo "completed (agent did not write summary — check $log)" > "$done_file"
+    echo "  ⚠️  [${task_id}] Missing done-file — wrote fallback" | tee -a "$log"
+  fi
+}
+
+# ── Per-task testing review (runs synchronously after each task commit) ────────
+#
+# Inspects the most recent commit. If new API routes or mutations were added,
+# checks whether corresponding integration tests exist. If not, writes them.
+# Can't write tests for features requiring browser/file/streaming interaction?
+# Appends to docs/browser-use-candidates.md instead.
+#
+run_task_test_review() {
+  local task_id="$1"
+  local done_file="$LOCK_DIR/test-review-${task_id}"
+  local log="$LOCK_DIR/log-test-review-${task_id}.txt"
+
+  # Skip if no commit was just made (task had no changes)
+  local last_commit_files
+  last_commit_files=$(git show HEAD --name-only --format="" 2>/dev/null) || last_commit_files=""
+  if [[ -z "$last_commit_files" ]]; then
+    echo "  ⏭️  [${task_id}] No committed files — skipping test review"
+    echo "no committed files" > "$done_file"
+    return 0
+  fi
+
+  # Quick pre-filter: only run if the commit touched src/ files
+  local has_src_changes
+  has_src_changes=$(echo "$last_commit_files" | grep -c '^src/' || true)
+  if (( has_src_changes == 0 )); then
+    echo "  ⏭️  [${task_id}] No src/ changes — skipping test review"
+    echo "no src changes" > "$done_file"
+    return 0
+  fi
+
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "🧪 Running testing review for [${task_id}]..."
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo ""
+
+  local prompt
+  prompt=$(load_agent "relay-test-reviewer")
+  prompt="${prompt//\{\{TASK_ID\}\}/${task_id}}"
+
+  rm -f "$done_file"
+  env -u CLAUDECODE -u ANTHROPIC_API_KEY claude --dangerously-skip-permissions \
+    --model claude-sonnet-4-6 \
+    -p "$prompt" 2>&1 | tee "$log"
+
+  echo ""
+  if [[ -f "$done_file" ]]; then
+    echo "🧪 Test review [${task_id}]:"
+    cat "$done_file"
+  else
+    echo "⚠️  Test review did not write done-file — check $LOCK_DIR/log-test-review-${task_id}.txt"
+    echo "   Proceeding without test review confirmation."
+  fi
+}
+
+# ── Code Simplifier gate (runs after each task commit, per-task) ──────────────
+run_simplify_gate() {
+  local task_id="$1"
+  local done_file="$LOCK_DIR/simplify-${task_id}"
+  local log="$LOCK_DIR/log-simplify-${task_id}.txt"
+
+  # Skip if no commit was just made
+  local last_commit_files
+  last_commit_files=$(git show HEAD --name-only --format="" 2>/dev/null) || last_commit_files=""
+  if [[ -z "$last_commit_files" ]]; then
+    echo "  ⏭️  [${task_id}] No committed files — skipping simplify gate"
+    echo "no committed files" > "$done_file"
+    return 0
+  fi
+
+  # Only run if the commit touched src/ files
+  local has_src_changes
+  has_src_changes=$(echo "$last_commit_files" | grep -c '^src/' || true)
+  if (( has_src_changes == 0 )); then
+    echo "  ⏭️  [${task_id}] No src/ changes — skipping simplify gate"
+    echo "no src changes" > "$done_file"
+    return 0
+  fi
+
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "🧹 Running Code Simplifier gate for [${task_id}]..."
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo ""
+
+  # Compute next SC-N counter (count existing SC-\d+ tasks)
+  local existing_sc_count
+  existing_sc_count=$(grep -c '^\- \[.\{0,1\}\] \*\*Task SC-[0-9]' "$TASKS_FILE" 2>/dev/null || echo 0)
+  local next_sc=$(( existing_sc_count + 1 ))
+  local next_sc2=$(( existing_sc_count + 2 ))
+
+  local prompt
+  prompt=$(load_agent "relay-code-simplifier")
+  prompt="${prompt//\{\{TASK_ID\}\}/${task_id}}"
+  prompt="${prompt//\{\{NEXT_SC\}\}/${next_sc}}"
+  prompt="${prompt//\{\{NEXT_SC2\}\}/${next_sc2}}"
+
+  rm -f "$done_file"
+  env -u CLAUDECODE -u ANTHROPIC_API_KEY claude --dangerously-skip-permissions \
+    --model claude-haiku-4-5-20251001 \
+    -p "$prompt" 2>&1 | tee "$log"
+
+  echo ""
+  if [[ -f "$done_file" ]]; then
+    echo "🧹 Simplify gate [${task_id}]:"
+    cat "$done_file"
+  else
+    echo "⚠️  Simplify gate did not write done-file — check $LOCK_DIR/log-simplify-${task_id}.txt"
+    echo "   Proceeding without simplify gate confirmation."
+  fi
+}
+
+# ── Hygiene gate (runs after Opus review gate, once per relay) ───────────────
+#
+# Lightweight organizational health check. Checks rules file size, root-level
+# TASKS-*.md clutter, broken doc references, and stale .continue-here.md.
+# Does NOT modify files — only appends HG-* tasks to TASKS_FILE if issues found.
+#
+run_hygiene_gate() {
+  local done_file="$LOCK_DIR/done-HYGIENE"
+  local log="$LOCK_DIR/log-HYGIENE.txt"
+
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "🧹 Running Hygiene gate..."
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo ""
+
+  # Compute next HG-N counter
+  local existing_hg_count
+  existing_hg_count=$(grep -c '^\- \[.\{0,1\}\] \*\*Task HG-[0-9]' "$TASKS_FILE" 2>/dev/null || echo 0)
+  local next_hg=$(( existing_hg_count + 1 ))
+
+  local prompt
+  prompt=$(load_agent "relay-hygiene")
+  prompt="${prompt//\{\{NEXT_HG\}\}/${next_hg}}"
+  prompt="${prompt//\{\{RELAY_BASE_SHA\}\}/${RELAY_BASE_SHA}}"
+
+  rm -f "$done_file"
+  env -u CLAUDECODE -u ANTHROPIC_API_KEY claude --dangerously-skip-permissions \
+    --model claude-haiku-4-5-20251001 \
+    -p "$prompt" 2>&1 | tee "$log"
+
+  echo ""
+  if [[ -f "$done_file" ]]; then
+    echo "🧹 Hygiene gate:"
+    cat "$done_file"
+  else
+    echo "⚠️  Hygiene gate did not write done-file — check $LOCK_DIR/log-HYGIENE.txt"
+    echo "   Proceeding without hygiene confirmation."
+  fi
+}
+
+# ── Review gate (runs synchronously after all tasks complete) ─────────────────
+run_review_gate() {
+  local done_file="$LOCK_DIR/done-REVIEW"
+  local log="$LOCK_DIR/log-REVIEW.txt"
+
+  local diff_size
+  diff_size=$(git diff "${RELAY_BASE_SHA}..HEAD" 2>/dev/null | wc -c) || diff_size=0
+  if (( diff_size == 0 )); then
+    echo "  ⏭️  No changes since relay start — skipping review gate"
+    return 0
+  fi
+
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "🔍 Running Opus review gate..."
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo ""
+
+  local prompt
+  prompt=$(load_agent "relay-review-gate")
+  prompt="${prompt//\{\{RELAY_BASE_SHA\}\}/${RELAY_BASE_SHA}}"
+
+  rm -f "$done_file"
+  env -u CLAUDECODE -u ANTHROPIC_API_KEY claude --dangerously-skip-permissions \
+    --model claude-opus-4-6 \
+    -p "$prompt" 2>&1 | tee "$log"
+
+  echo ""
+  if [[ -f "$done_file" ]]; then
+    echo "✅ Review gate:"
+    cat "$done_file"
+  else
+    echo "⚠️  Review gate did not write done-file — check $LOCK_DIR/log-REVIEW.txt"
+    echo "   Proceeding without review confirmation."
+  fi
+}
+
+# ── Critique gate (runs synchronously after review gate) ──────────────────────
+#
+# Screenshots all UI-touched pages from this relay run. Uses Sonnet vision to
+# evaluate each screenshot for P1/P2 regressions. If issues are found, appends
+# a new critique phase block to TASKS.md.
+#
+run_critique_gate() {
+  local done_file="$LOCK_DIR/done-CRITIQUE"
+  local log="$LOCK_DIR/log-CRITIQUE.txt"
+
+  # Quick check: did this relay touch any UI files?
+  local ui_files
+  ui_files=$(git diff "${RELAY_BASE_SHA}..HEAD" --name-only 2>/dev/null \
+    | grep -E '(src/app/.*/page\.tsx|src/components/.*\.tsx)' || true)
+
+  if [[ -z "$ui_files" ]]; then
+    echo "  ⏭️  No UI files changed — skipping critique gate"
+    echo "SKIPPED — no UI files touched in this relay run" > "$done_file"
+    return 0
+  fi
+
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "👁️  Running Sonnet visual critique gate..."
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo ""
+
+  local prompt
+  prompt=$(load_agent "relay-critique")
+  prompt="${prompt//\{\{RELAY_BASE_SHA\}\}/${RELAY_BASE_SHA}}"
+
+  rm -f "$done_file"
+  env -u CLAUDECODE -u ANTHROPIC_API_KEY claude --dangerously-skip-permissions \
+    --model claude-sonnet-4-6 \
+    -p "$prompt" 2>&1 | tee "$log"
+
+  echo ""
+  if [[ -f "$done_file" ]]; then
+    echo "👁️  Critique gate:"
+    cat "$done_file"
+  else
+    echo "⚠️  Critique gate did not write done-file — check $LOCK_DIR/log-CRITIQUE.txt"
+    echo "   Proceeding without critique confirmation."
+  fi
+}
+
+# ── Main execution loop ────────────────────────────────────────────────────────
+pending_gate_pids=()   # PIDs of background gate subshells (test-review + simplify)
+TOTAL_LAUNCHED=0
+RELAY_BASE_SHA=$(git rev-parse HEAD)   # snapshot before any relay commits
+
+# ── PR mode: create a branch ──────────────────────────────────────────────────
+if [[ "$PR_MODE" == true ]]; then
+  RELAY_BRANCH="relay/$(date +%Y-%m-%d-%H%M%S)"
+  git checkout -b "$RELAY_BRANCH"
+  echo "   PR mode: branch $RELAY_BRANCH created"
+fi
+
+echo "🏁 Parallel Relay Race"
+echo "   parallel: ${MAX_PARALLEL}  |  file: ${TASKS_FILE}"
+[[ "$USE_GEMINI" == true ]] && echo "   agent: Gemini → Claude fallback" \
+                             || echo "   agent: Claude"
+echo ""
+
+while true; do
+
+  # ── Reap completed background processes ─────────────────────────────────────
+  for pid in $(_map_pids_list); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      local_task_id=$(_map_get_task "$pid")
+      local_task_line=$(_map_get_line "$pid")
+      local_done_file="$LOCK_DIR/done-${local_task_id}"
+
+      if [[ -f "$local_done_file" ]]; then
+        local_summary=$(cat "$local_done_file")
+
+        # ── Handle scout outcomes (normalize to lowercase for robust matching) ──
+        local_summary_lower=$(echo "$local_summary" | head -1 | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//')
+
+        if [[ "$local_summary_lower" == scout:\ skip* ]]; then
+          echo "⏭️  [${local_task_id}] Scout skip: $local_summary"
+          mark_done "$local_task_id" "$local_summary"
+          # No commit needed — no code was changed
+
+        elif [[ "$local_summary_lower" == scout:\ blocked* ]]; then
+          echo ""
+          echo "🛑 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🛑 [${local_task_id}] BLOCKED — needs human decision"
+          echo "🛑 $local_summary"
+          echo "🛑 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          # Write [B] to TASKS.md (not [x]) so dependents don't unblock
+          # and humans/agents can see the decision needed inline
+          mark_blocked "$local_task_id" "$local_summary"
+
+        else
+          # ── Normal completion ────────────────────────────────────────
+          echo "✅ [${local_task_id}] Done: $local_summary"
+          mark_done "$local_task_id" "$local_summary"
+          local_desc=$(echo "$local_task_line" | sed 's/- \[ \] //' | cut -c1-72)
+          do_commit "${local_task_id}: $local_desc"
+          if [[ "$SKIP_TEST_REVIEW_GATE" != true || "$SKIP_SIMPLIFY_GATE" != true ]]; then
+            (
+              [[ "$SKIP_TEST_REVIEW_GATE" != true ]] && run_task_test_review "$local_task_id"
+              [[ "$SKIP_SIMPLIFY_GATE" != true ]]    && run_simplify_gate "$local_task_id"
+            ) &
+            gate_pid=$!
+            pending_gate_pids+=("$gate_pid")
+            echo "  🔧 [${local_task_id}] Gates launched in background (PID $gate_pid)"
+          fi
+        fi
+      else
+        echo "⚠️  [${local_task_id}] No done-file — may have failed. Check $LOCK_DIR/log-${local_task_id}.txt"
+      fi
+
+      unclaim "$local_task_id"
+      _map_del "$pid"
+    fi
+  done
+
+  local_running=$(_map_size)
+
+  # ── Check for completion ───────────────────────────────────────────────────
+  local_remaining=$(grep -c '^\- \[ \]' "$TASKS_FILE" 2>/dev/null) || local_remaining=0
+  if (( local_remaining == 0 && local_running == 0 )); then
+    if (( ${#pending_gate_pids[@]} > 0 )); then
+      echo "⏳ Waiting for quality gates to finish..."
+      for gpid in "${pending_gate_pids[@]}"; do
+        wait "$gpid" 2>/dev/null || true
+      done
+      pending_gate_pids=()
+      # Re-check: a gate may have added SC-* tasks
+      local_remaining=$(grep -c '^\- \[ \]' "$TASKS_FILE" 2>/dev/null) || local_remaining=0
+      [[ $local_remaining -gt 0 ]] && continue
+    fi
+    # Check for any scout-blocked tasks before declaring victory
+    local_scout_blocked
+    local_scout_blocked=$(grep -c '^\- \[B\]' "$TASKS_FILE" 2>/dev/null) || local_scout_blocked=0
+    echo ""
+    if (( local_scout_blocked > 0 )); then
+      echo "⚠️  Tasks complete, but $local_scout_blocked task(s) are scout-blocked (need human decisions):"
+      grep '^\- \[B\]' "$TASKS_FILE" | while IFS= read -r bline; do
+        btid=$(task_id_of "$bline")
+        echo "   🛑 [$btid] — see task body in ${TASKS_FILE} for the decision needed"
+      done
+      if [[ -f "$LOCK_DIR/BLOCKED-SUMMARY.txt" ]]; then
+        echo ""
+        echo "   Full decision log: $LOCK_DIR/BLOCKED-SUMMARY.txt"
+      fi
+    else
+      echo "🎉 All tasks complete!"
+    fi
+    break
+  fi
+
+
+  # ── Launch eligible tasks up to MAX_PARALLEL ───────────────────────────────
+  while (( local_running < MAX_PARALLEL && TOTAL_LAUNCHED < MAX_TASKS && local_remaining > 0 )); do
+    next_id=""
+    next_line=""
+
+    while IFS= read -r line; do
+      [[ "$line" =~ ^\-\ \[\ \] ]] || continue
+      tid=$(task_id_of "$line")
+      [[ -z "$tid" ]] && continue
+      is_claimed "$tid" && continue
+      deps_satisfied "$line" || continue
+      next_id="$tid"
+      next_line="$line"
+      break
+    done < "$TASKS_FILE"
+
+    [[ -z "$next_id" ]] && break  # Nothing runnable right now
+
+    # Guard: if agent completed but relay crashed before updating TASKS.md, skip re-run
+    if [[ -f "$LOCK_DIR/done-$next_id" ]]; then
+      echo "  ⏭️  [${next_id}] Already done (done-file exists) — marking complete"
+      mark_done "$next_id" "$(head -1 "$LOCK_DIR/done-$next_id")"
+      continue
+    fi
+
+    claim "$next_id" || continue  # Lost the race — try another
+
+    model=$(model_of "$next_line")
+    label=$(model_label_of "$next_line")
+    deps_str=$(deps_of "$next_line" | tr '\n' ' ')
+
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "🔄 Launching [${next_id}] (${label})"
+    [[ -n "$deps_str" ]] && echo "   deps: $deps_str"
+    if (( local_running > 0 )); then
+      echo "   parallel with: $(_map_tasks_list)"
+    fi
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+
+    # Wave conflict check (only relevant when running in parallel)
+    if (( local_running > 0 )); then
+      running_task_ids=($(_map_tasks_list))
+      if ! check_wave_conflict "$next_id" "${running_task_ids[@]}"; then
+        if [[ "$STRICT_CONFLICTS" == true ]]; then
+          echo "  ⛔ [${next_id}] Skipping — file conflict with running task (--strict-conflicts)"
+          unclaim "$next_id"
+          break   # break inner loop; outer loop will retry when running task finishes
+        fi
+        # Default: warn but proceed
+        echo "  ⚡ [${next_id}] Proceeding despite potential conflict (use --strict-conflicts to serialize)"
+      fi
+    fi
+
+    run_task "$next_id" "$next_line" "$model" &
+    bg_pid=$!
+    _map_set "$bg_pid" "$next_id" "$next_line"
+    (( local_running++ )) || true
+    (( TOTAL_LAUNCHED++ )) || true
+  done
+
+  # ── Deadlock detection ─────────────────────────────────────────────────────
+  if (( local_running == 0 && local_remaining > 0 )); then
+    # Classify remaining tasks: scout-blocked-dep stall vs real circular deadlock
+    real_deadlock=false
+    while IFS= read -r line; do
+      [[ "$line" =~ ^\-\ \[\ \] ]] || continue
+      tid=$(task_id_of "$line")
+      deps_str=$(deps_of "$line" | tr '\n' ' ')
+      # Check if every unsatisfied dep is [B] (blocked) — if so, not a real deadlock
+      has_blocked_dep=false
+      has_unblocked_dep=false
+      for dep in $(deps_of "$line"); do
+        if grep -q "^\- \[B\].*Task[[:space:]]*${dep}" "$TASKS_FILE" 2>/dev/null; then
+          has_blocked_dep=true
+        elif ! grep -q "^\- \[x\].*Task[[:space:]]*${dep}" "$TASKS_FILE" 2>/dev/null; then
+          has_unblocked_dep=true
+        fi
+      done
+      if [[ "$has_unblocked_dep" == true ]]; then
+        real_deadlock=true
+        echo "  ⛔ [$tid] circular/missing dep — needs: ${deps_str:-none}"
+      elif [[ "$has_blocked_dep" == true ]]; then
+        echo "  ⏸️  [$tid] waiting on scout-blocked dep — needs: ${deps_str:-none}"
+      else
+        # No unsatisfied deps but still [ ] — shouldn't happen, treat as deadlock
+        real_deadlock=true
+        echo "  ⛔ [$tid] unresolvable — needs: ${deps_str:-none}"
+      fi
+    done < "$TASKS_FILE"
+
+    if [[ "$real_deadlock" == true ]]; then
+      echo ""
+      echo "⚠️  Deadlock: $local_remaining task(s) remain with circular or missing deps."
+      exit 1
+    else
+      echo ""
+      echo "⏸️  $local_remaining task(s) are waiting on scout-blocked dependencies."
+      echo "   Resolve the 🛑 BLOCKED tasks in ${TASKS_FILE}, reset them to [ ], then re-run."
+    fi
+    break
+  fi
+
+  # ── Wait for any running agent to finish ───────────────────────────────────
+  if (( local_running > 0 )); then
+    if [[ "$HAS_WAIT_N" == true ]]; then
+      wait -n 2>/dev/null || true   # bash 4.3+: wake when any child exits
+    else
+      sleep 5                        # fallback: poll
+    fi
+  fi
+
+done
+
+# Final wait for any stragglers
+wait 2>/dev/null || true
+
+# Cleanup
+rm -rf "$LOCK_DIR"/claim-* "$LOCK_DIR"/*.lock 2>/dev/null || true
+
+# ── Review gate ───────────────────────────────────────────────────────────────
+if [[ "$SKIP_REVIEW_GATE" != true ]]; then
+  run_review_gate
+else
+  echo ""
+  echo "⏭️  Review gate skipped (--skip-review)"
+fi
+
+# ── Hygiene gate ──────────────────────────────────────────────────────────────
+if [[ "$SKIP_HYGIENE_GATE" != true ]]; then
+  run_hygiene_gate
+else
+  echo ""
+  echo "⏭️  Hygiene gate skipped (--skip-hygiene)"
+fi
+
+# ── Critique gate ─────────────────────────────────────────────────────────────
+if [[ "$SKIP_CRITIQUE_GATE" != true ]]; then
+  run_critique_gate
+else
+  echo ""
+  echo "⏭️  Critique gate skipped (--skip-critique)"
+fi
+
+# ── Browser-use gate ──────────────────────────────────────────────────────────
+if [[ "$SKIP_BROWSER_GATE" != true ]]; then
+  echo ""
+  echo "🌐 Running browser-use smart test picker..."
+  # Look for devtools version first, fall back to project-local
+  _pick_script=""
+  if [[ -x "${DEVTOOLS_ROOT}/bin/pick-browser-tests" ]]; then
+    _pick_script="${DEVTOOLS_ROOT}/bin/pick-browser-tests"
+  elif [[ -x "${REPO_ROOT}/scripts/pick-browser-tests.sh" ]]; then
+    _pick_script="${REPO_ROOT}/scripts/pick-browser-tests.sh"
+  fi
+  if [[ -n "$_pick_script" ]]; then
+    bash "$_pick_script" --base "${RELAY_BASE_SHA:-main}" || {
+      echo "  ⚠️  Browser-use gate failed (exit $?) — see output above"
+    }
+  else
+    echo "  ⏭️  pick-browser-tests not found or not executable — skipping"
+  fi
+else
+  echo ""
+  echo "⏭️  Browser-use gate skipped (--skip-browser)"
+fi
+
+# ── Vet debate gate ───────────────────────────────────────────────────────────
+if [[ "$SKIP_VET_GATE" != true ]]; then
+  echo ""
+  echo "🔍 Running vet-debate gate (Claude ↔ Gemini, 3-turn)..."
+  VET_HAS_MUST_FIX=false
+  # Look for devtools version first, fall back to project-local
+  _vet_script=""
+  if [[ -x "${DEVTOOLS_ROOT}/bin/vet-debate" ]]; then
+    _vet_script="${DEVTOOLS_ROOT}/bin/vet-debate"
+  elif [[ -x "${REPO_ROOT}/scripts/vet-debate.sh" ]]; then
+    _vet_script="${REPO_ROOT}/scripts/vet-debate.sh"
+  fi
+  if [[ -n "$_vet_script" ]]; then
+    if ! bash "$_vet_script" --base-commit "${RELAY_BASE_SHA:-main}"; then
+      VET_HAS_MUST_FIX=true
+      echo "  ⚠️  Vet debate found must-fix issues"
+    fi
+  else
+    echo "  ⏭️  vet-debate not found or not executable — skipping"
+  fi
+else
+  echo ""
+  echo "⏭️  Vet debate gate skipped (--skip-vet)"
+fi
+
+# ── PR creation (if --pr mode) ───────────────────────────────────────────────
+if [[ "$PR_MODE" == true ]]; then
+  echo ""
+  echo "📋 Creating pull request..."
+  git push -u origin "$RELAY_BRANCH" 2>/dev/null || git push origin "$RELAY_BRANCH"
+
+  # Build PR body
+  TASK_COUNT=$(grep -c '^\- \[x\]' "$TASKS_FILE" 2>/dev/null || echo "0")
+  VET_SUMMARY=""
+  if [[ -f /tmp/vet-debate/report.json ]]; then
+    VET_SUMMARY=$(python3 -c "import json; d=json.load(open('/tmp/vet-debate/report.json')); print(d.get('summary', 'N/A'))" 2>/dev/null || echo "N/A")
+  fi
+
+  PR_BODY="## Relay Run Summary
+- Tasks completed: $TASK_COUNT
+- Vet debate: ${VET_SUMMARY:-skipped}
+
+## Quality Gates
+- Opus review: $(if [[ "$SKIP_REVIEW_GATE" == true ]]; then echo 'skipped'; else echo 'passed'; fi)
+- Vet debate: $(if [[ "$SKIP_VET_GATE" == true ]]; then echo 'skipped'; elif [[ "$VET_HAS_MUST_FIX" == true ]]; then echo 'MUST-FIX ISSUES'; else echo 'passed'; fi)
+- Browser-use: $(if [[ "$SKIP_BROWSER_GATE" == true ]]; then echo 'skipped'; else echo 'ran'; fi)
+
+Generated with [Claude Code](https://claude.com/claude-code) relay-race"
+
+  PR_URL=$(gh pr create --title "relay: $(date +%Y-%m-%d) — $TASK_COUNT tasks" --body "$PR_BODY" --base main)
+  PR_NUMBER=$(basename "$PR_URL")
+  echo "   PR created: $PR_URL"
+  echo "   → Run from terminal: relay-race review-pr $PR_NUMBER"
+
+  if [[ "$VET_HAS_MUST_FIX" == true ]]; then
+    echo ""
+    echo "  ⚠️  PR created with must-fix issues — manual review required"
+  elif [[ "$AUTO_MERGE" == true ]]; then
+    echo ""
+    echo "  Enabling auto-merge..."
+    gh pr merge --auto --squash || echo "  ⚠️  Auto-merge requires branch protection rules (enable in GitHub settings)"
+  fi
+fi
+
+echo ""
+echo "🏁 Done. Tasks launched: $TOTAL_LAUNCHED"
+echo "   Logs: $LOCK_DIR/log-*.txt"
+if [[ "$PR_MODE" == true ]]; then
+  echo "   Branch: $RELAY_BRANCH"
+fi

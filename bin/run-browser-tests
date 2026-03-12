@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# run-browser-tests — run browser-use tests (Python/Pytest)
+#
+# Usage:
+#   devtools run-browser-tests                    # all tests (full suite)
+#   devtools run-browser-tests --smoke            # smoke suite only
+#   devtools run-browser-tests auth_login         # single test by name
+#   devtools run-browser-tests --dry-run          # list tests without running
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../lib/config.sh"
+source "${SCRIPT_DIR}/../lib/helpers.sh"
+
+cd "$REPO_ROOT"
+
+BT_DIR="${REPO_ROOT}/${BROWSER_TESTS_DIR}"
+VENV="${BT_DIR}/.venv"
+
+# ── Load env from .env.local ───────────────────────────────────────────────────
+if [[ -f "${REPO_ROOT}/.env.local" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source <(grep -v '^#' "${REPO_ROOT}/.env.local" | grep -v '^[[:space:]]*$')
+  set +a
+fi
+
+# ── Validate prerequisites ─────────────────────────────────────────────────────
+if [[ ! -d "${VENV}" ]]; then
+  die "Python venv not found at ${VENV}. Run one-time setup in ${BROWSER_TESTS_DIR}/"
+fi
+
+# Check required env vars from config
+while IFS= read -r var_name; do
+  [[ -z "$var_name" ]] && continue
+  if [[ -z "${!var_name:-}" ]]; then
+    die "${var_name} is not set. Add it to .env.local"
+  fi
+done < <(config_get_list "browser_tests.required_env")
+
+# ── Parse arguments ────────────────────────────────────────────────────────────
+DRY_RUN=false
+TEST_NAME=""
+SUITE="full"
+
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run)   DRY_RUN=true ;;
+    --suite=*)   SUITE="${arg#--suite=}" ;;
+    --smoke)     SUITE="smoke" ;;
+    --*)         die "Unknown flag: $arg" ;;
+    *)           TEST_NAME="$arg" ;;
+  esac
+done
+
+# ── Activate venv ──────────────────────────────────────────────────────────────
+# shellcheck disable=SC1091
+source "${VENV}/bin/activate"
+
+# ── Run ───────────────────────────────────────────────────────────────────────
+if [[ "$DRY_RUN" == true ]]; then
+  echo "Browser-use tests (dry run):"
+  python -m pytest "${BT_DIR}" --collect-only -q
+
+elif [[ -n "${TEST_NAME}" ]]; then
+  TARGET="${BT_DIR}/test_${TEST_NAME}.py"
+  if [[ ! -f "$TARGET" ]]; then
+    die "Test file not found: ${TARGET}"
+  fi
+  echo "Running: test_${TEST_NAME}.py"
+  python -m pytest "${TARGET}" -v -s
+
+elif [[ "$SUITE" == "smoke" ]]; then
+  echo "Running smoke suite..."
+  # Find smoke tests — look for test files with "smoke" in name or just auth_login
+  if [[ -f "${BT_DIR}/test_auth_login.py" ]]; then
+    python -m pytest "${BT_DIR}/test_auth_login.py" -v -s
+  else
+    echo "No smoke test found. Running all tests."
+    python -m pytest "${BT_DIR}" -v -s
+  fi
+
+else
+  echo "Running all browser-use tests..."
+  python -m pytest "${BT_DIR}" -v -s
+fi

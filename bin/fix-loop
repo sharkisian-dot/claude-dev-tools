@@ -1,0 +1,573 @@
+#!/usr/bin/env bash
+# fix-loop — review PR, auto-fix issues, push, repeat until clean
+#
+# Usage:
+#   fix-loop 19                     # review + fix PR #19
+#   fix-loop 19 --deep              # (legacy alias, now default)
+#   fix-loop 19 --review-only       # review without auto-fixing
+#   fix-loop 19 --skip-test-coverage # skip test coverage reviewer
+#   fix-loop 19 --skip-file-org      # skip file organization reviewer
+#   fix-loop 19 --no-merge           # don't auto-merge after approval
+#
+# Flow:
+#   Round 1: all 4 reviewers in parallel (correctness, complexity, test coverage, file org)
+#   Rounds 2-3: correctness only (no strategic reviewers)
+#   After round 3: meta-reviewer decides: continue | approve | escalate
+#   Rounds 4-6: if meta says continue, resumes with correctness only
+#   After round 6: escalates to human review regardless
+#
+# Requires: claude CLI (authenticated), gh CLI (authenticated)
+# Run from terminal only — NOT from inside Claude Code (nested session detection)
+
+set -eo pipefail
+
+# ── Library and sibling script loading ───────────────────────────────────────
+
+LIB_DIR="$(cd "$(dirname "$0")/../lib" && pwd)"
+BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+source "${LIB_DIR}/config.sh"
+source "${LIB_DIR}/helpers.sh"
+source "${LIB_DIR}/agents.sh"
+
+# Source shared definitions (REVIEW_PROMPT, OPUS_PROMPT, TEST_COVERAGE_PROMPT,
+# FILE_ORG_PROMPT, build_context, check_deps from the devtools review-pr script)
+# shellcheck source=bin/review-pr
+source "${BIN_DIR}/review-pr"
+
+cleanup() { rm -f /tmp/fix-loop-*.* 2>/dev/null || true; }
+trap cleanup EXIT
+
+MAX_CONTEXT_BYTES=600000  # ~150K tokens — leaves room for prompt + response in 200K window
+BATCH_SIZE=3              # rounds per batch before meta-review
+MAX_BATCHES=2             # max 2 batches = 6 total rounds
+REVIEW_ONLY=false
+SKIP_TEST_COVERAGE=false
+SKIP_FILE_ORG=false
+AUTO_MERGE=true
+PR_NUMBER=""
+
+# ── Args ──────────────────────────────────────────────────────────────────────
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --deep)                shift ;;  # legacy alias, now default behavior
+    --review-only)         REVIEW_ONLY=true;         shift ;;
+    --skip-test-coverage)  SKIP_TEST_COVERAGE=true;  shift ;;
+    --skip-file-org)       SKIP_FILE_ORG=true;       shift ;;
+    --no-merge)            AUTO_MERGE=false;         shift ;;
+    *)                     PR_NUMBER="$1";           shift ;;
+  esac
+done
+
+if [[ -z "$PR_NUMBER" ]]; then
+  echo "Usage: fix-loop <PR#> [--review-only] [--skip-test-coverage] [--skip-file-org] [--no-merge]"
+  exit 1
+fi
+
+# ── Trigger detection ─────────────────────────────────────────────────────────
+
+# Returns 0 if PR diff has src/ changes without corresponding test changes
+has_source_without_tests() {
+  local names
+  names=$(gh pr diff "$PR_NUMBER" --name-only 2>/dev/null) || return 1
+  echo "$names" | grep -q '^src/' || return 1
+  echo "$names" | grep -qE '__tests__|\.test\.|\.spec\.' && return 1
+  return 0
+}
+
+# Returns 0 if PR diff adds new files under src/
+has_new_files() {
+  gh pr view "$PR_NUMBER" --json files \
+    --jq '.files[] | select(.additions > 0 and .deletions == 0) | .path' 2>/dev/null \
+    | grep -q '^src/'
+}
+
+# ── Review history tracking ──────────────────────────────────────────────────
+
+REVIEW_HISTORY_DIR=""
+init_review_history() {
+  REVIEW_HISTORY_DIR=$(mktemp -d /tmp/fix-loop-history.XXXXXX)
+}
+
+save_round_review() {
+  local round="$1"
+  local json_file="$2"
+  cp "$json_file" "${REVIEW_HISTORY_DIR}/round-${round}.json"
+}
+
+build_meta_context() {
+  local meta_file
+  meta_file=$(mktemp /tmp/fix-loop-meta.XXXXXX)
+
+  echo "# Review History for PR #${PR_NUMBER}" > "$meta_file"
+  echo "" >> "$meta_file"
+
+  for f in "${REVIEW_HISTORY_DIR}"/round-*.json; do
+    [[ -f "$f" ]] || continue
+    local rnum
+    rnum=$(basename "$f" | sed 's/round-//' | sed 's/.json//')
+    local issue_count verdict
+    issue_count=$(jq '.issues | length' < "$f")
+    verdict=$(jq -r '.verdict' < "$f")
+    local summary
+    summary=$(jq -r '.summary' < "$f")
+
+    echo "## Round ${rnum} — ${issue_count} issues — verdict: ${verdict}" >> "$meta_file"
+    echo "" >> "$meta_file"
+    echo "**Summary:** ${summary}" >> "$meta_file"
+    echo "" >> "$meta_file"
+    echo "**Issues:**" >> "$meta_file"
+    jq -r '.issues[] | "- [\(.severity)] \(.file):\(.line) — \(.message)"' < "$f" >> "$meta_file"
+    echo "" >> "$meta_file"
+  done
+
+  echo "$meta_file"
+}
+
+run_meta_review() {
+  local output_file="$1"
+
+  local meta_context_file
+  meta_context_file=$(build_meta_context)
+
+  info "Running meta-review (analyzing ${BATCH_SIZE} rounds of history)..."
+
+  local meta_prompt
+  meta_prompt=$(load_agent "review-meta")
+
+  local raw_file
+  raw_file=$(mktemp /tmp/fix-loop-metaraw.XXXXXX)
+
+  if ! env -u CLAUDECODE claude -p "${meta_prompt}
+
+$(cat "$meta_context_file")" \
+    --model sonnet \
+    --output-format text \
+    --max-turns 1 \
+    > "$raw_file" 2>/dev/null; then
+    err "Meta-review failed — defaulting to escalate"
+    echo '{"decision":"escalate","reasoning":"meta-review failed","guidance":null}' > "$output_file"
+    rm -f "$raw_file" "$meta_context_file"
+    return
+  fi
+
+  if ! parse_review_json "$(cat "$raw_file")" > "$output_file"; then
+    err "Failed to parse meta-review — defaulting to escalate"
+    echo '{"decision":"escalate","reasoning":"parse failed","guidance":null}' > "$output_file"
+  fi
+
+  rm -f "$raw_file" "$meta_context_file"
+}
+
+# ── Run a review pass → writes JSON to a file ────────────────────────────────
+
+run_review_pass() {
+  local prompt="$1"
+  local model="$2"
+  local reviewer_name="$3"
+  local context_file="$4"
+  local output_json_file="$5"
+
+  info "Running ${reviewer_name} review..."
+
+  local raw_output_file
+  raw_output_file=$(mktemp /tmp/fix-loop-raw.XXXXXX)
+
+  if ! env -u CLAUDECODE claude -p "${prompt}
+
+$(cat "$context_file")" \
+    --model "$model" \
+    --output-format text \
+    --max-turns 1 \
+    > "$raw_output_file" 2>/dev/null; then
+    err "${reviewer_name} review failed"
+    echo '{"summary":"review failed","issues":[],"verdict":"comment"}' > "$output_json_file"
+    rm -f "$raw_output_file"
+    return
+  fi
+
+  if ! parse_review_json "$(cat "$raw_output_file")" > "$output_json_file"; then
+    err "Failed to parse ${reviewer_name} output"
+    log "Raw (first 500 chars): $(head -c 500 "$raw_output_file")"
+    echo '{"summary":"parse failed","issues":[],"verdict":"comment"}' > "$output_json_file"
+  fi
+
+  rm -f "$raw_output_file"
+}
+
+# ── Post review to GitHub ─────────────────────────────────────────────────────
+
+post_github_review() {
+  local pr="$1"
+  local json_file="$2"
+  local round="$3"
+  local event="$4"
+
+  local summary issue_count
+  summary=$(jq -r '.summary' < "$json_file")
+  issue_count=$(jq '.issues | length' < "$json_file")
+
+  local body_file
+  body_file=$(mktemp /tmp/fix-loop-body.XXXXXX)
+
+  {
+    echo "## Fix Loop — Round ${round}"
+    echo ""
+    echo "**${summary}**"
+    echo ""
+    if [[ "$issue_count" -gt 0 ]]; then
+      echo "### Issues (${issue_count})"
+      echo ""
+      jq -r '.issues[] | "- **\(.severity)** `\(.file):\(.line)`: \(.message)"' < "$json_file"
+    else
+      echo "No issues found."
+    fi
+  } > "$body_file"
+
+  local review_body
+  review_body=$(cat "$body_file")
+  rm -f "$body_file"
+
+  gh api "repos/{owner}/{repo}/pulls/${pr}/reviews" \
+    -X POST \
+    --field event="$event" \
+    --field body="$review_body" \
+    > /dev/null 2>&1 || {
+      if [[ "$event" != "COMMENT" ]]; then
+        gh api "repos/{owner}/{repo}/pulls/${pr}/reviews" \
+          -X POST \
+          --field event="COMMENT" \
+          --field body="$review_body" \
+          > /dev/null 2>&1 || true
+      fi
+    }
+}
+
+# ── Run auto-fix agent ────────────────────────────────────────────────────────
+
+run_fixer() {
+  local json_file="$1"
+  local round="$2"
+
+  local issues_text
+  issues_text=$(jq -r '.issues[] | "[\(.severity)] \(.file):\(.line) — \(.message)"' < "$json_file")
+  local issue_count
+  issue_count=$(jq '.issues | length' < "$json_file")
+
+  info "Fixing ${issue_count} issues..."
+
+  local guidance_block=""
+  if [[ -n "$FIXER_GUIDANCE" ]]; then
+    guidance_block="
+META-REVIEWER GUIDANCE (from analyzing previous fix rounds — pay close attention):
+${FIXER_GUIDANCE}
+"
+  fi
+
+  # Load base fixer prompt from agent definition (substitutes {{TEST_COMMAND}}, {{RULES_FILE}})
+  local fixer_base_prompt
+  fixer_base_prompt=$(load_agent "fixer")
+
+  # Inject runtime context (issues + guidance) after the base prompt
+  local fixer_prompt
+  fixer_prompt="${fixer_base_prompt}
+
+ISSUES TO FIX:
+${issues_text}
+${guidance_block}"
+
+  local fixer_stderr fixer_stdout
+  fixer_stderr=$(mktemp /tmp/fix-loop-fixer-stderr.XXXXXX)
+  fixer_stdout=$(mktemp /tmp/fix-loop-fixer-stdout.XXXXXX)
+
+  env -u CLAUDECODE claude -p "$fixer_prompt" \
+    --model sonnet \
+    --dangerously-skip-permissions \
+    --output-format text \
+    > "$fixer_stdout" 2>"$fixer_stderr" || {
+      err "Fixer agent failed (round ${round})"
+      [[ -s "$fixer_stderr" ]] && cat "$fixer_stderr" >&2
+      echo "  Last 20 lines of fixer output:" >&2
+      tail -20 "$fixer_stdout" >&2
+      rm -f "$fixer_stderr" "$fixer_stdout"
+      return 1
+    }
+
+  rm -f "$fixer_stderr" "$fixer_stdout"
+
+  info "Fixer agent completed (round ${round})"
+}
+
+# ── Merge review JSON files ──────────────────────────────────────────────────
+
+merge_review_files() {
+  # Takes a list of JSON file paths, merges them into one
+  local -a files=("$@")
+  if [[ "${#files[@]}" -eq 1 ]]; then
+    cat "${files[0]}"
+    return
+  fi
+  jq -s '
+    {
+      summary: (map(.summary) | join(" | ")),
+      issues: ([.[] | .issues[]] | unique_by(.file + ":" + (.line|tostring))),
+      verdict: (if any(.verdict == "request_changes") then "request_changes"
+                elif any(.verdict == "comment") then "comment"
+                else "approve" end)
+    }' "${files[@]}"
+}
+
+# ── Run one review+fix round → returns 0 if clean, 1 if issues remain ───────
+
+run_round() {
+  local round="$1"
+  local total_rounds="$2"
+
+  info "━━━ Round ${round}/${total_rounds} ━━━"
+
+  # Build fresh context each round (diff changes after fixes)
+  local context_file
+  context_file=$(build_context "$PR_NUMBER")
+  local context_size
+  context_size=$(wc -c < "$context_file" | tr -d ' ')
+  log "Context: $(( context_size / 1024 ))KB"
+
+  # ── Launch reviewers ──
+
+  local sonnet_file opus_file coverage_file fileorg_file
+  sonnet_file=$(mktemp /tmp/fix-loop-sonnet.XXXXXX)
+  local -a review_files=()
+  local -a bg_pids=()
+
+  # Sonnet correctness — always runs, every round
+  run_review_pass "$REVIEW_PROMPT" "sonnet" "Sonnet" "$context_file" "$sonnet_file" &
+  bg_pids+=($!)
+  review_files+=("$sonnet_file")
+
+  # Strategic reviewers — round 1 only
+  if [[ "$round" -eq 1 ]]; then
+    # Opus complexity — always on round 1
+    opus_file=$(mktemp /tmp/fix-loop-opus.XXXXXX)
+    run_review_pass "$OPUS_PROMPT" "opus" "Opus Architect" "$context_file" "$opus_file" &
+    bg_pids+=($!)
+    review_files+=("$opus_file")
+
+    # Test coverage — if source changed without test changes
+    if [[ "$SKIP_TEST_COVERAGE" != "true" ]] && has_source_without_tests; then
+      coverage_file=$(mktemp /tmp/fix-loop-coverage.XXXXXX)
+      run_review_pass "$TEST_COVERAGE_PROMPT" "sonnet" "Test Coverage" "$context_file" "$coverage_file" &
+      bg_pids+=($!)
+      review_files+=("$coverage_file")
+      log "Test coverage reviewer: triggered (src changes without test changes)"
+    fi
+
+    # File organization — if new files in diff
+    if [[ "$SKIP_FILE_ORG" != "true" ]] && has_new_files; then
+      fileorg_file=$(mktemp /tmp/fix-loop-fileorg.XXXXXX)
+      run_review_pass "$FILE_ORG_PROMPT" "sonnet" "File Organization" "$context_file" "$fileorg_file" &
+      bg_pids+=($!)
+      review_files+=("$fileorg_file")
+      log "File org reviewer: triggered (new files in diff)"
+    fi
+  fi
+
+  # Wait for all reviewers to complete
+  for pid in "${bg_pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+
+  # Merge all results
+  local merged_file
+  merged_file=$(mktemp /tmp/fix-loop-merged.XXXXXX)
+  merge_review_files "${review_files[@]}" > "$merged_file"
+
+  # Clean up individual files
+  rm -f "${review_files[@]}"
+
+  local issue_count verdict
+  issue_count=$(jq '.issues | length' < "$merged_file")
+  verdict=$(jq -r '.verdict' < "$merged_file")
+
+  info "Round ${round}: ${issue_count} issues — verdict: ${verdict}"
+
+  # Save to history for meta-review
+  save_round_review "$round" "$merged_file"
+
+  # Clean — post approval and exit
+  if [[ "$issue_count" -eq 0 || "$verdict" == "approve" ]]; then
+    info "Clean! Posting approval review."
+    post_github_review "$PR_NUMBER" "$merged_file" "$round" "APPROVE"
+    rm -f "$merged_file" "$context_file"
+    return 0
+  fi
+
+  # Post the review findings to GitHub
+  post_github_review "$PR_NUMBER" "$merged_file" "$round" "COMMENT"
+
+  # Review-only mode: stop here
+  if [[ "$REVIEW_ONLY" == "true" ]]; then
+    info "Review-only mode — skipping auto-fix."
+    jq -r '.issues[] | "  [\(.severity)] \(.file):\(.line) — \(.message)"' < "$merged_file"
+    rm -f "$merged_file" "$context_file"
+    return 0
+  fi
+
+  # Auto-fix
+  run_fixer "$merged_file" "$round"
+
+  # Check if fixer made changes
+  if git diff --quiet && git diff --cached --quiet; then
+    info "No changes made by fixer — issues may require manual intervention."
+    jq -r '.issues[] | "  [\(.severity)] \(.file):\(.line) — \(.message)"' < "$merged_file"
+    rm -f "$merged_file" "$context_file"
+    return 2  # signal: fixer couldn't help
+  fi
+
+  # Commit and push — add only files flagged in the review (prevents rogue new files)
+  while IFS= read -r flagged_file; do
+    [[ -n "$flagged_file" ]] && git add -- "$flagged_file" 2>/dev/null || true
+  done < <(jq -r '.issues[].file' < "$merged_file" | sort -u)
+  git commit -m "fix: review round ${round} — ${issue_count} issues"
+  git push
+
+  rm -f "$merged_file" "$context_file"
+  info "Pushed fixes (round ${round})"
+  echo ""
+  return 1  # issues were found and fixed, continue looping
+}
+
+# ── Auto-merge ───────────────────────────────────────────────────────────────
+
+merge_pr() {
+  if [[ "$AUTO_MERGE" != "true" || "$REVIEW_ONLY" == "true" ]]; then
+    return
+  fi
+  info "Auto-merging PR #${PR_NUMBER}..."
+  if gh pr merge "$PR_NUMBER" --squash --admin 2>/dev/null; then
+    info "PR #${PR_NUMBER} merged."
+  else
+    err "Auto-merge failed — merge manually."
+  fi
+}
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+main() {
+  check_deps claude gh jq
+  init_review_history
+
+  local max_rounds=$(( BATCH_SIZE * MAX_BATCHES ))
+  info "PR #${PR_NUMBER}: Starting fix loop (${BATCH_SIZE} rounds/batch, max ${max_rounds} rounds)"
+  echo ""
+
+  local overall_round=0
+  local FIXER_GUIDANCE=""
+
+  for batch in $(seq 1 "$MAX_BATCHES"); do
+    info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    info "  Batch ${batch}/${MAX_BATCHES}"
+    info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+
+    for batch_round in $(seq 1 "$BATCH_SIZE"); do
+      overall_round=$(( overall_round + 1 ))
+
+      local result=0
+      run_round "$overall_round" "$max_rounds" || result=$?
+
+      if [[ "$result" -eq 0 ]]; then
+        # Clean or review-only
+        echo ""
+        info "PR #${PR_NUMBER} is clean after ${overall_round} round(s)."
+        merge_pr
+        rm -rf "$REVIEW_HISTORY_DIR"
+        exit 0
+      elif [[ "$result" -eq 2 ]]; then
+        # Fixer couldn't make changes — escalate immediately
+        echo ""
+        err "PR #${PR_NUMBER}: Fixer could not resolve issues. Flagged for human review."
+        rm -rf "$REVIEW_HISTORY_DIR"
+        exit 1
+      fi
+      # result=1: fixed issues, continue to next round
+    done
+
+    # End of batch — run meta-review (unless this is the last batch)
+    if [[ "$batch" -lt "$MAX_BATCHES" ]]; then
+      echo ""
+      info "━━━ Meta-review after batch ${batch} ━━━"
+
+      local meta_file
+      meta_file=$(mktemp /tmp/fix-loop-meta-result.XXXXXX)
+      run_meta_review "$meta_file"
+      local decision reasoning guidance
+      decision=$(jq -r '.decision // "escalate"' < "$meta_file")
+      reasoning=$(jq -r '.reasoning // "no reasoning"' < "$meta_file")
+      guidance=$(jq -r '.guidance // empty' < "$meta_file")
+      rm -f "$meta_file"
+
+      info "Meta-review decision: ${decision}"
+      log "Reasoning: ${reasoning}"
+      if [[ -n "$guidance" && "$guidance" != "null" ]]; then
+        log "Guidance for next batch: ${guidance}"
+      fi
+
+      # Post meta-review to GitHub
+      local meta_body="## Meta-Review (after batch ${batch})
+
+**Decision:** ${decision}
+**Reasoning:** ${reasoning}"
+      if [[ -n "$guidance" && "$guidance" != "null" ]]; then
+        meta_body+="
+**Guidance:** ${guidance}"
+      fi
+      gh api "repos/{owner}/{repo}/pulls/${PR_NUMBER}/reviews" \
+        -X POST \
+        --field event="COMMENT" \
+        --field body="$meta_body" \
+        > /dev/null 2>&1 || true
+
+      case "$decision" in
+        approve)
+          info "Meta-reviewer approved. Posting approval."
+          local approve_file
+          approve_file=$(mktemp /tmp/fix-loop-approve.XXXXXX)
+          echo "{\"summary\":\"Meta-reviewer approved: ${reasoning}\",\"issues\":[],\"verdict\":\"approve\"}" > "$approve_file"
+          post_github_review "$PR_NUMBER" "$approve_file" "meta" "APPROVE"
+          rm -f "$approve_file"
+          echo ""
+          info "PR #${PR_NUMBER} approved by meta-reviewer after ${overall_round} rounds."
+          merge_pr
+          rm -rf "$REVIEW_HISTORY_DIR"
+          exit 0
+          ;;
+        escalate)
+          echo ""
+          err "PR #${PR_NUMBER}: Meta-reviewer recommends human review after ${overall_round} rounds."
+          log "Reason: ${reasoning}"
+          rm -rf "$REVIEW_HISTORY_DIR"
+          exit 1
+          ;;
+        continue)
+          FIXER_GUIDANCE="$guidance"
+          info "Continuing to batch $(( batch + 1 ))..."
+          echo ""
+          ;;
+        *)
+          err "Unknown meta decision: ${decision} — escalating."
+          rm -rf "$REVIEW_HISTORY_DIR"
+          exit 1
+          ;;
+      esac
+    fi
+  done
+
+  # Exhausted all batches
+  echo ""
+  err "PR #${PR_NUMBER}: ${max_rounds} rounds across ${MAX_BATCHES} batches. Flagged for human review."
+  rm -rf "$REVIEW_HISTORY_DIR"
+  exit 1
+}
+
+main "$@"

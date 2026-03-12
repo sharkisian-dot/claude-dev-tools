@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# devtools — dispatcher for claude-dev-tools commands
+#
+# Usage:
+#   devtools <command> [args...]
+#   devtools help
+#   devtools list
+#
+# Checks bin/ for built-in commands first, then plugins from .devtools.yaml.
+
+set -eo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEVTOOLS_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# ── Help ─────────────────────────────────────────────────────────────────────
+
+show_help() {
+  echo "devtools — AI-powered dev tooling suite"
+  echo ""
+  echo "Usage: devtools <command> [args...]"
+  echo ""
+  echo "Built-in commands:"
+  for cmd in "${SCRIPT_DIR}"/*; do
+    [[ -x "$cmd" && "$(basename "$cmd")" != "devtools" ]] || continue
+    local name desc
+    name=$(basename "$cmd")
+    desc=$(head -5 "$cmd" | grep '^# ' | head -1 | sed 's/^# [^ ]* — //')
+    printf "  %-22s %s\n" "$name" "${desc:-}"
+  done
+
+  # Check for plugins
+  if [[ -f ".devtools.yaml" ]]; then
+    local has_plugins=false
+    while IFS= read -r line; do
+      if [[ "$line" =~ command:\ *(.+) ]]; then
+        has_plugins=true
+        break
+      fi
+    done < <(grep 'command:' .devtools.yaml 2>/dev/null || true)
+
+    if $has_plugins; then
+      echo ""
+      echo "Plugins (from .devtools.yaml):"
+      # Simple grep-based plugin listing
+      local in_plugins=false
+      while IFS= read -r line; do
+        if [[ "$line" =~ ^plugins: ]]; then
+          in_plugins=true
+          continue
+        fi
+        if $in_plugins; then
+          [[ "$line" =~ ^[a-zA-Z] ]] && break
+          if [[ "$line" =~ command:\ *\"?([^\"]+)\"? ]]; then
+            printf "  %-22s (plugin)\n" "${BASH_REMATCH[1]}"
+          fi
+        fi
+      done < .devtools.yaml
+    fi
+  fi
+
+  echo ""
+  echo "Run 'devtools <command> --help' for command-specific help."
+}
+
+# ── Dispatch ─────────────────────────────────────────────────────────────────
+
+CMD="${1:-help}"
+shift || true
+
+case "$CMD" in
+  help|-h|--help)
+    show_help
+    exit 0
+    ;;
+  list)
+    for cmd in "${SCRIPT_DIR}"/*; do
+      [[ -x "$cmd" && "$(basename "$cmd")" != "devtools" ]] || continue
+      basename "$cmd"
+    done
+    exit 0
+    ;;
+esac
+
+# Check built-in commands first
+BUILTIN="${SCRIPT_DIR}/${CMD}"
+if [[ -x "$BUILTIN" ]]; then
+  exec "$BUILTIN" "$@"
+fi
+
+# Check plugins from .devtools.yaml
+if [[ -f ".devtools.yaml" ]]; then
+  PLUGIN_PATH=""
+  local_in_plugins=false
+  local_found_command=false
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^plugins: ]]; then
+      local_in_plugins=true
+      continue
+    fi
+    if $local_in_plugins; then
+      [[ "$line" =~ ^[a-zA-Z] ]] && break
+      if [[ "$line" =~ path:\ *\"?([^\"]+)\"? ]]; then
+        PLUGIN_PATH="${BASH_REMATCH[1]}"
+      fi
+      if [[ "$line" =~ command:\ *\"?([^\"]+)\"? ]]; then
+        if [[ "${BASH_REMATCH[1]}" == "$CMD" ]]; then
+          local_found_command=true
+          break
+        fi
+        PLUGIN_PATH=""
+      fi
+    fi
+  done < .devtools.yaml
+
+  if $local_found_command && [[ -n "$PLUGIN_PATH" && -x "$PLUGIN_PATH" ]]; then
+    exec "$PLUGIN_PATH" "$@"
+  fi
+fi
+
+echo "Unknown command: $CMD" >&2
+echo "Run 'devtools help' to see available commands." >&2
+exit 1

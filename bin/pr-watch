@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# pr-watch — watch CI checks for the current branch's PR and report failures
+#
+# Usage: devtools pr-watch [--pr <number>]
+
+set -euo pipefail
+
+BRANCH=$(git branch --show-current 2>/dev/null || echo "")
+[[ -z "$BRANCH" ]] && { echo "❌ Not on a named branch"; exit 1; }
+
+# Parse optional --pr flag
+PR_NUMBER=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --pr) PR_NUMBER="${2:-}"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+
+# Get or create PR
+if [[ -z "$PR_NUMBER" ]]; then
+  PR_NUMBER=$(gh pr view --json number --jq '.number' 2>/dev/null || echo "")
+fi
+
+if [[ -z "$PR_NUMBER" ]]; then
+  echo "▶ No open PR for branch '$BRANCH'. Creating one..."
+  gh pr create --fill
+  PR_NUMBER=$(gh pr view --json number --jq '.number')
+  echo "✓ PR #$PR_NUMBER created"
+fi
+
+echo "▶ Watching PR #$PR_NUMBER checks (branch: $BRANCH)..."
+echo "  Ctrl+C to stop watching (CI continues in the background)"
+echo ""
+
+# Watch until all checks complete
+if gh pr checks "$PR_NUMBER" --watch 2>/dev/null; then
+  echo ""
+  echo "✅ All checks passed! PR #$PR_NUMBER is ready to merge."
+  exit 0
+fi
+
+echo ""
+echo "❌ Some checks failed. Fetching failure details..."
+echo ""
+
+# Find the most recent run for this branch
+RUN_ID=$(gh run list --branch "$BRANCH" --limit 1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || echo "")
+
+if [[ -n "$RUN_ID" ]]; then
+  echo "══ Failed job logs (run #$RUN_ID) ══════════════════════════════"
+  gh run view "$RUN_ID" --log-failed 2>/dev/null || gh run view "$RUN_ID" 2>/dev/null || true
+  echo "════════════════════════════════════════════════════════════════"
+else
+  echo "Could not fetch run logs. Check manually: gh pr checks $PR_NUMBER"
+fi
+
+echo ""
+echo "Fix the issues above, then push and re-run."
+exit 1

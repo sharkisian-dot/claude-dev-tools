@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# opus-plan — invoke Opus in planning-only mode
+#
+# IMPORTANT: Cannot be run from within a Claude Code session.
+# Use from a separate terminal.
+#
+# Usage:
+#   devtools opus-plan "Add undo functionality for entity merges"
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../lib/config.sh"
+source "${SCRIPT_DIR}/../lib/helpers.sh"
+source "${SCRIPT_DIR}/../lib/agents.sh"
+
+require_terminal
+
+if [[ -z "${1:-}" ]]; then
+  echo "Usage: devtools opus-plan \"Task description\"" >&2
+  exit 1
+fi
+
+TASK="$1"
+AGENT_PROMPT=$(load_agent "planner")
+
+echo "Invoking Opus for planning..." >&2
+echo "" >&2
+echo "TASK: $TASK" >&2
+echo "" >&2
+
+env -u CLAUDECODE claude --model claude-opus-4-6 -p "${AGENT_PROMPT}
+
+MODE: PLAN
+Task: $TASK"

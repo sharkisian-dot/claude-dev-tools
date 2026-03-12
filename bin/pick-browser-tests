@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# pick-browser-tests — AI-driven test selector for browser-use tests
+#
+# Reads git diff, checks the test manifest, and picks which browser-use tests
+# to run. Uses a fast/cheap AI call (Haiku) to reason about indirect dependencies.
+#
+# Usage:
+#   devtools pick-browser-tests                  # pick + run
+#   devtools pick-browser-tests --dry-run        # pick only, print test names
+#   devtools pick-browser-tests --base main      # diff against specific base
+#   devtools pick-browser-tests --all            # force run all tests
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../lib/config.sh"
+source "${SCRIPT_DIR}/../lib/helpers.sh"
+
+cd "$REPO_ROOT"
+
+MANIFEST="${REPO_ROOT}/${BROWSER_TESTS_MANIFEST}"
+
+# ── Defaults ────────────────────────────────────────────────────────────────
+DRY_RUN=false
+BASE_REF="main"
+FORCE_ALL=false
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --dry-run)   DRY_RUN=true;      shift ;;
+    --base)      BASE_REF="$2";     shift 2 ;;
+    --all)       FORCE_ALL=true;    shift ;;
+    *)           echo "Unknown arg: $1"; exit 1 ;;
+  esac
+done
+
+if [[ ! -f "$MANIFEST" ]]; then
+  info "Test manifest not found at $MANIFEST — skipping browser tests"
+  exit 0
+fi
+
+# ── Get changed files ──────────────────────────────────────────────────────
+CHANGED_FILES=$(git diff --name-only "${BASE_REF}"...HEAD 2>/dev/null || git diff --name-only HEAD~1 2>/dev/null || echo "")
+
+if [[ -z "$CHANGED_FILES" ]]; then
+  echo "No changed files detected. Nothing to test."
+  exit 0
+fi
+
+# ── Force all? ─────────────────────────────────────────────────────────────
+if [[ "$FORCE_ALL" == true ]]; then
+  ALL_TESTS=$(jq -r '.tests | keys[]' "$MANIFEST")
+  if [[ "$DRY_RUN" == true ]]; then
+    echo "$ALL_TESTS"
+  else
+    for t in $ALL_TESTS; do
+      bash "${SCRIPT_DIR}/run-browser-tests" "$t" || true
+    done
+  fi
+  exit 0
+fi
+
+# ── Phase 1: Manifest-based matching (fast, free) ─────────────────────────
+MATCHED_TESTS=""
+
+# Check always_run_on patterns (foundational files → run all)
+ALWAYS_RUN_ON=$(jq -r '.always_run_on[]' "$MANIFEST")
+RUN_ALL=false
+for pattern in $ALWAYS_RUN_ON; do
+  if echo "$CHANGED_FILES" | grep -qE "^${pattern//\*/.*}$"; then
+    RUN_ALL=true
+    break
+  fi
+done
+
+if [[ "$RUN_ALL" == true ]]; then
+  MATCHED_TESTS=$(jq -r '.tests | keys[]' "$MANIFEST")
+else
+  # Check each test's trigger patterns
+  for test_key in $(jq -r '.tests | keys[]' "$MANIFEST"); do
+    TRIGGERS=$(jq -r ".tests.\"${test_key}\".triggers[]" "$MANIFEST")
+    for trigger in $TRIGGERS; do
+      grep_pattern=$(echo "$trigger" | sed 's/\*\*/DOUBLESTAR/g' | sed 's/\*/[^\/]*/g' | sed 's/DOUBLESTAR/.*/g')
+      if echo "$CHANGED_FILES" | grep -qE "^${grep_pattern}"; then
+        MATCHED_TESTS="${MATCHED_TESTS}${test_key}\n"
+        break
+      fi
+    done
+  done
+
+  # Always include always_run_tests
+  ALWAYS_RUN=$(jq -r '.always_run_tests[]' "$MANIFEST" 2>/dev/null || true)
+  for t in $ALWAYS_RUN; do
+    MATCHED_TESTS="${MATCHED_TESTS}${t}\n"
+  done
+fi
+
+# Deduplicate
+MATCHED_TESTS=$(echo -e "$MATCHED_TESTS" | sort -u | grep -v '^$' || true)
+
+# ── Phase 2: AI reasoning for indirect deps (cheap, optional) ─────────────
+AI_EXTRA=""
+if command -v claude &>/dev/null && [[ "$RUN_ALL" != true ]]; then
+  MANIFEST_SUMMARY=$(jq -r '.tests | to_entries[] | "\(.key): \(.value.description) — triggers: \(.value.triggers | join(", "))"' "$MANIFEST")
+
+  AI_PROMPT="Given these changed files:
+${CHANGED_FILES}
+
+And these available browser-use tests:
+${MANIFEST_SUMMARY}
+
+The manifest already matched these tests: ${MATCHED_TESTS:-none}
+
+Are there any ADDITIONAL tests that should run due to indirect dependencies?
+Reply with ONLY a comma-separated list of additional test keys, or 'none'."
+
+  AI_RESULT=$(echo "$AI_PROMPT" | env -u CLAUDECODE claude --model claude-haiku-4-5-20251001 -p 2>/dev/null || echo "none")
+  AI_RESULT=$(echo "$AI_RESULT" | tr -d '[:space:]' | tr ',' '\n')
+
+  if [[ "$AI_RESULT" != "none" && -n "$AI_RESULT" ]]; then
+    VALID_KEYS=$(jq -r '.tests | keys[]' "$MANIFEST")
+    for suggested in $AI_RESULT; do
+      if echo "$VALID_KEYS" | grep -qx "$suggested"; then
+        AI_EXTRA="${AI_EXTRA}${suggested}\n"
+      fi
+    done
+  fi
+fi
+
+# ── Combine and deduplicate ──────────────────────────────────────────────
+ALL_SELECTED=$(echo -e "${MATCHED_TESTS}\n${AI_EXTRA}" | sort -u | grep -v '^$' || true)
+
+if [[ -z "$ALL_SELECTED" ]]; then
+  echo "No browser-use tests needed for these changes."
+  exit 0
+fi
+
+# ── Output ──────────────────────────────────────────────────────────────────
+TEST_COUNT=$(echo "$ALL_SELECTED" | wc -l | tr -d ' ')
+
+echo "Selected ${TEST_COUNT} browser-use test(s) based on changes:"
+echo "$ALL_SELECTED" | while read -r t; do
+  NAME=$(jq -r ".tests.\"${t}\".name // \"${t}\"" "$MANIFEST")
+  echo "   ${t} — ${NAME}"
+done
+echo ""
+
+if [[ "$DRY_RUN" == true ]]; then
+  echo "$ALL_SELECTED"
+  exit 0
+fi
+
+# ── Run selected tests ──────────────────────────────────────────────────────
+PASS=0
+FAIL=0
+for t in $ALL_SELECTED; do
+  echo "━━━ Running: ${t} ━━━"
+  if bash "${SCRIPT_DIR}/run-browser-tests" "$t"; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+  fi
+  echo ""
+done
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "Browser-use results: ${PASS} passed, ${FAIL} failed (of ${TEST_COUNT})"
+[[ $FAIL -eq 0 ]] && exit 0 || exit 1

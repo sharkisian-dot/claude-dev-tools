@@ -1,0 +1,460 @@
+#!/usr/bin/env bash
+# lane — manage persistent dev agent lanes
+#
+# Each lane is a long-lived Docker container with its own git worktree.
+# Lanes persist across feature branches — after a merge, switch branches
+# inside the lane and keep going.
+#
+# Usage:
+#   lane start <name> [branch]   # create worktree + start container
+#   lane open <name> [branch]    # start + attach in one step (most common)
+#   lane restart <name>           # stop, remove, and restart container (worktree kept)
+#   lane attach <name>            # attach a shell (then run: claude)
+#   lane stop <name>              # stop container (worktree preserved)
+#   lane rm <name>                # stop container + remove worktree
+#   lane status                   # list all lanes and their branches
+#   lane branch <name> <branch>   # switch to a new branch in a lane
+#   lane sync [name]              # merge origin/main into all (or one) lane worktree(s)
+#
+# Authentication:
+#   Claude Max auth is read from ~/.claude on your Mac (mounted read-only).
+#   No API key needed — uses your existing subscription.
+#
+# Port allocation:
+#   Prefers lane-1→3001, lane-2→3002, etc. but auto-finds next free port if taken.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Source shared libraries
+# shellcheck source=../lib/config.sh
+source "${SCRIPT_DIR}/../lib/config.sh"
+# shellcheck source=../lib/helpers.sh
+source "${SCRIPT_DIR}/../lib/helpers.sh"
+
+# Resolve WORKTREES_DIR from config (may be a relative path like "../project-lanes")
+# Resolve it relative to REPO_ROOT
+WORKTREES_DIR="$(cd "$REPO_ROOT" && cd "$LANE_WORKTREES_DIR" 2>/dev/null && pwd || echo "${REPO_ROOT}/${LANE_WORKTREES_DIR}")"
+DEV_IMAGE="${LANE_IMAGE}"
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+# Resolve Claude auth token automatically.
+# Sets ANTHROPIC_AUTH_TOKEN in the current shell if not already set.
+resolve_claude_token() {
+  if [[ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]]; then
+    return 0  # already set
+  fi
+  local creds="${HOME}/.claude/.credentials.json"
+  if [[ -f "$creds" ]]; then
+    local token
+    token="$(python3 -c "import json; print(json.load(open('$creds'))['claudeAiOauth']['accessToken'])" 2>/dev/null)"
+    if [[ -n "$token" ]]; then
+      export ANTHROPIC_AUTH_TOKEN="$token"
+      return 0
+    fi
+  fi
+  echo "⚠  Could not resolve Claude auth token — containers will require manual 'claude auth login'"
+  return 1
+}
+
+resolve_github_token() {
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    return 0  # already set
+  fi
+  # Try gh CLI first
+  if command -v gh &>/dev/null; then
+    local token
+    token="$(gh auth token 2>/dev/null)"
+    if [[ -n "$token" ]]; then
+      export GITHUB_TOKEN="$token"
+      return 0
+    fi
+  fi
+  # Fall back to git credential store (macOS Keychain, etc.)
+  local cred_output
+  cred_output="$(printf 'protocol=https\nhost=github.com\n' | git credential fill 2>/dev/null)"
+  local token
+  token="$(echo "$cred_output" | grep '^password=' | cut -d= -f2-)"
+  if [[ -n "$token" ]]; then
+    export GITHUB_TOKEN="$token"
+    return 0
+  fi
+  echo "⚠  Could not resolve GitHub token — agents will not be able to git push"
+  echo "   Fix: brew install gh && gh auth login"
+  return 1
+}
+
+container_name() { echo "lane-${1}"; }
+
+worktree_path() { echo "${WORKTREES_DIR}/${1}"; }
+
+# Find a free port starting from the preferred one
+find_free_port() {
+  local preferred="$1"
+  local port="$preferred"
+  while lsof -iTCP:"$port" -sTCP:LISTEN -t &>/dev/null 2>&1 || \
+        docker ps --format '{{.Ports}}' | grep -q "0.0.0.0:${port}->"; do
+    (( port++ ))
+  done
+  echo "$port"
+}
+
+# Derive preferred port from lane name: lane-1→3001, lane-2→3002, lane-abc→3010
+lane_port() {
+  local name="$1"
+  local num preferred
+  num=$(echo "$name" | grep -oE '[0-9]+$' || echo "")
+  if [[ -n "$num" && "$num" -le 20 ]]; then
+    preferred=$((3000 + num))
+  else
+    preferred=3010
+  fi
+  find_free_port "$preferred"
+}
+
+require_image() {
+  if ! docker image inspect "$DEV_IMAGE" &>/dev/null; then
+    echo "Dev image not found. Building..."
+    docker build -f "${REPO_ROOT}/${LANE_DOCKERFILE}" -t "$DEV_IMAGE" "${REPO_ROOT}"
+  fi
+}
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+cmd_start() {
+  local name="${1:-}" branch="${2:-}"
+  [[ -z "$name" ]] && die "Usage: lane start <name> [branch]"
+
+  resolve_github_token || true  # warn but don't abort
+  resolve_claude_token || true  # warn but don't abort
+
+  local worktree port container env_file claude_dir
+  worktree="$(worktree_path "$name")"
+  container="$(container_name "$name")"
+  env_file="${REPO_ROOT}/.env.local"
+  claude_dir="${HOME}/.claude"
+
+  # Validate prerequisites
+  [[ -f "$env_file" ]] || die ".env.local not found at $env_file"
+  [[ -d "$claude_dir" ]] || die "~/.claude not found — log in to Claude Code first: claude auth login"
+
+  # Create worktree if needed
+  mkdir -p "$WORKTREES_DIR"
+  if [[ -d "$worktree" ]]; then
+    echo "✓ Worktree already exists: $worktree"
+
+    # Verify it's a proper worktree (file) not an accidental clone (directory)
+    if [[ -d "${worktree}/.git" ]]; then
+      die "Lane '$name' looks like a git clone, not a worktree (.git is a directory).
+   This will cause merge conflicts. Fix it:
+     lane rm $name
+     lane start $name"
+    fi
+    if ! grep -q '^gitdir:' "${worktree}/.git" 2>/dev/null; then
+      die "Lane '$name' has a malformed .git pointer. Fix it:
+   lane rm $name && lane start $name"
+    fi
+  else
+    if [[ -z "$branch" ]]; then
+      branch="lane/${name}-$(date +%Y%m%d)"
+    fi
+    # Fetch latest main so the new branch starts from the freshest snapshot
+    echo "▶ Fetching latest main from origin..."
+    cd "$REPO_ROOT"
+    git fetch origin main --quiet && git merge --ff-only origin/main --quiet 2>/dev/null || true
+
+    echo "▶ Creating worktree: $worktree (branch: $branch)"
+    git worktree add "$worktree" -b "$branch" 2>/dev/null \
+      || git worktree add "$worktree" "$branch"
+    # Copy .env.local into the worktree (not tracked by git)
+    cp "$env_file" "${worktree}/.env.local"
+    echo "✓ Worktree created"
+  fi
+
+  # Stop existing container if running
+  if docker ps -q --filter "name=^${container}$" | grep -q .; then
+    echo "⚠  Container $container already running"
+    echo "   Attach with: lane attach $name"
+    return 0
+  fi
+
+  # Remove stopped/failed container with same name if exists
+  docker rm -f "$container" 2>/dev/null || true
+
+  # Allocate port after removing old container so its port is freed
+  port="$(lane_port "$name")"
+
+  require_image
+
+  # The worktree's .git file is a pointer to an absolute host path like:
+  #   gitdir: /Users/you/repo/.git/worktrees/lane-1
+  # That path doesn't exist inside the container unless we mount the main .git dir
+  # at the same absolute path. We extract the gitdir path to mount it correctly.
+  local git_dir_host git_dir_container_path lane_branch
+  git_dir_host="${REPO_ROOT}/.git"
+  git_dir_container_path="$(sed 's/gitdir: //' "${worktree}/.git" | sed 's|/worktrees/.*||')"
+  lane_branch="$(cd "$worktree" && git branch --show-current 2>/dev/null || echo 'unknown')"
+
+  echo "▶ Starting container $container (app port: $port, branch: $lane_branch)"
+  docker run -dit \
+    --name "$container" \
+    -p "${port}:3000" \
+    -v "${worktree}:/workspace" \
+    -v "${git_dir_host}:${git_dir_container_path}" \
+    -v "lane_claude_${name}:/home/dev/.claude" \
+    -v "lane_sessionenv_${name}:/home/dev/.claude/session-env" \
+    -v "${env_file}:/workspace/.env.local:ro" \
+    -e "TERM=xterm-256color" \
+    -e "LANE_NAME=${name}" \
+    -e "LANE_BRANCH=${lane_branch}" \
+    -e "LANE_MERGE_TARGET=main" \
+    ${GITHUB_TOKEN:+-e "GITHUB_TOKEN=${GITHUB_TOKEN}"} \
+    ${ANTHROPIC_AUTH_TOKEN:+-e "ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN}"} \
+    -e "GIT_AUTHOR_NAME=$(git config user.name 2>/dev/null || echo 'Dev Agent')" \
+    -e "GIT_AUTHOR_EMAIL=$(git config user.email 2>/dev/null || echo 'dev@local')" \
+    -e "GIT_COMMITTER_NAME=$(git config user.name 2>/dev/null || echo 'Dev Agent')" \
+    -e "GIT_COMMITTER_EMAIL=$(git config user.email 2>/dev/null || echo 'dev@local')" \
+    "$DEV_IMAGE" \
+    bash -c "cd /workspace && npm install --silent 2>/dev/null; exec bash"
+
+  # ── Post-start verification ──────────────────────────────────────────────────
+
+  # 0. Fix permissions and seed Claude config into the named volume.
+  #    Named volume (lane_claude_<name>) persists across restarts so `claude auth login`
+  #    only needs to happen once per lane, not every restart.
+  docker exec -u root "$container" chown -R dev:dev /home/dev/.claude 2>/dev/null || true
+  # Seed settings.json from host if not already present in the volume
+  docker exec "$container" bash -c "test -f /home/dev/.claude/settings.json" 2>/dev/null \
+    || docker cp "${claude_dir}/settings.json" "${container}:/home/dev/.claude/settings.json" 2>/dev/null || true
+  # Write minimal .claude.json to skip onboarding wizard
+  docker exec "$container" bash -c "python3 -c \"
+import json, os
+path = '/home/dev/.claude.json'
+try:
+    d = json.load(open(path)) if os.path.exists(path) else {}
+except Exception:
+    d = {}
+d['hasCompletedOnboarding'] = True
+d.setdefault('lastOnboardingVersion', '1.0.0')
+json.dump(d, open(path, 'w'), indent=2)
+\" 2>/dev/null || true"
+
+  # 1. Bash smoke test: verify session-env dir is accessible (Bash tool prereq).
+  echo "▶ Verifying container health..."
+  local smoke_ok=false
+  for _ in 1 2 3; do
+    if docker exec "$container" bash -c "echo ok" &>/dev/null; then
+      smoke_ok=true; break
+    fi
+    sleep 1
+  done
+  if $smoke_ok; then
+    echo "✓ Bash tool OK"
+  else
+    echo "⚠  Bash smoke test failed — container shell is not responding"
+    echo "   Check logs: docker logs $container"
+    echo "   The agent may not be able to commit or run tests"
+  fi
+
+  # 2. Verify git remote is accessible inside the container.
+  local remote_url
+  remote_url="$(docker exec "$container" bash -c "git -C /workspace remote get-url origin 2>/dev/null" || true)"
+  if [[ -n "$remote_url" ]]; then
+    echo "✓ Git remote OK ($remote_url)"
+  else
+    echo "⚠  No git remote found inside container — agents cannot push"
+    echo "   This usually means the .git mount didn't resolve. Check:"
+    echo "     docker exec lane-$name bash -c 'cat /workspace/.git && git remote -v'"
+  fi
+
+  # 3. Write MOTD so agents see their context and push instructions on attach.
+  docker exec "$container" bash -c "cat > /home/dev/.bash_motd << 'MOTD'
+
+┌─────────────────────────────────────────────────────┐
+│  🚀 Lane ${name} — Agent Container                        │
+│                                                     │
+│  Branch:       ${lane_branch}
+│  Merge target: main                                 │
+│  Remote:       $(git -C "$worktree" remote get-url origin 2>/dev/null || echo 'see git remote -v')
+│                                                     │
+│  ✅ Before finishing your session:                  │
+│     git add -A && git commit -m 'your message'      │
+│     git push origin HEAD                            │
+│     bash scripts/pr-watch.sh   ← tail CI & fix     │
+│                                                     │
+│  pr-watch.sh creates the PR if needed, waits for   │
+│  CI, prints failure logs, and exits non-zero so    │
+│  you know to fix and push again.                   │
+└─────────────────────────────────────────────────────┘
+MOTD
+echo 'cat /home/dev/.bash_motd 2>/dev/null || true' >> /home/dev/.bashrc" 2>/dev/null || true
+
+  echo ""
+  echo "✅ Lane '$name' is running"
+  echo "   Worktree:  $worktree"
+  echo "   Branch:    $lane_branch (merge target: main)"
+  echo "   App port:  localhost:$port (after npm run dev inside)"
+  echo ""
+  echo "   Attach:    lane attach $name"
+  echo "   Then run:  claude"
+  echo ""
+  echo "   Agent context injected via env vars:"
+  echo "     LANE_NAME=$name  LANE_BRANCH=$lane_branch  LANE_MERGE_TARGET=main"
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    echo "     GITHUB_TOKEN=*** (set — git push will work)"
+  else
+    echo "     GITHUB_TOKEN not set — agents cannot git push directly"
+    echo "     Set it with: export GITHUB_TOKEN=<token> before running lane start"
+  fi
+  # Check if this lane has Claude credentials persisted in its named volume
+  if docker exec "$container" bash -c "test -f /home/dev/.claude/.credentials.json" 2>/dev/null; then
+    echo "     Claude auth: ✓ credentials found (persisted in volume)"
+  else
+    echo "     Claude auth: run 'claude auth login' inside container (one-time setup)"
+  fi
+}
+
+cmd_attach() {
+  local name="${1:-}"
+  [[ -z "$name" ]] && die "Usage: lane attach <name>"
+  local container
+  container="$(container_name "$name")"
+  docker ps --filter "name=^${container}$" --format '{{.Names}}' | grep -q . \
+    || die "Lane '$name' is not running. Start it first: lane start $name"
+  echo "Attaching to $container — run 'claude' to start the agent, 'exit' to detach"
+  docker exec -it "$container" bash
+}
+
+cmd_stop() {
+  local name="${1:-}"
+  [[ -z "$name" ]] && die "Usage: lane stop <name>"
+  local container
+  container="$(container_name "$name")"
+  echo "▶ Stopping $container (worktree preserved)"
+  docker stop "$container" 2>/dev/null && echo "✓ Stopped" || echo "⚠  Not running"
+}
+
+cmd_rm() {
+  local name="${1:-}"
+  [[ -z "$name" ]] && die "Usage: lane rm <name>"
+  local container worktree
+  container="$(container_name "$name")"
+  worktree="$(worktree_path "$name")"
+
+  docker stop "$container" 2>/dev/null || true
+  docker rm "$container" 2>/dev/null && echo "✓ Container removed" || true
+
+  if [[ -d "$worktree" ]]; then
+    cd "$REPO_ROOT"
+    git worktree remove --force "$worktree" 2>/dev/null && echo "✓ Worktree removed" \
+      || echo "⚠  Could not remove worktree (uncommitted changes?): $worktree"
+  fi
+}
+
+cmd_branch() {
+  local name="${1:-}" branch="${2:-}"
+  [[ -z "$name" || -z "$branch" ]] && die "Usage: lane branch <name> <new-branch>"
+  local worktree
+  worktree="$(worktree_path "$name")"
+  [[ -d "$worktree" ]] || die "Worktree not found for lane '$name'. Did you start it?"
+
+  echo "▶ Switching lane '$name' to branch '$branch'"
+  cd "$worktree"
+  git fetch origin main --quiet
+  git checkout main 2>/dev/null || git checkout -b main origin/main
+  git pull --quiet
+  git checkout -b "$branch" 2>/dev/null || git checkout "$branch"
+  echo "✓ Lane '$name' is now on branch: $branch"
+}
+
+cmd_sync() {
+  local name="${1:-}"
+  echo "▶ Fetching origin/main..."
+  git -C "$REPO_ROOT" fetch origin main --quiet
+
+  local lanes=()
+  if [[ -n "$name" ]]; then
+    lanes=("$name")
+  else
+    # All worktrees except main itself
+    while IFS= read -r wt_path; do
+      lanes+=("$(basename "$wt_path")")
+    done < <(git -C "$REPO_ROOT" worktree list --porcelain \
+      | grep '^worktree ' | awk '{print $2}' \
+      | grep -v "^${REPO_ROOT}$")
+  fi
+
+  local ok=0 failed=0
+  for lane in "${lanes[@]}"; do
+    local wt
+    wt="$(worktree_path "$lane")"
+    if [[ ! -d "$wt" ]]; then
+      echo "⚠  No worktree for lane '$lane' — skipping"
+      continue
+    fi
+    local branch
+    branch="$(git -C "$wt" branch --show-current 2>/dev/null || echo '?')"
+    printf "  %-12s (%s) ... " "$lane" "$branch"
+    if git -C "$wt" merge --ff-only origin/main --quiet 2>/dev/null; then
+      echo "✓ up to date"
+      (( ok++ )) || true
+    elif git -C "$wt" merge origin/main --no-edit --quiet 2>/dev/null; then
+      echo "✓ merged"
+      (( ok++ )) || true
+    else
+      echo "✗ conflict — resolve manually in $wt"
+      (( failed++ )) || true
+    fi
+  done
+
+  echo ""
+  echo "✅ $ok synced, $failed failed"
+  [[ $failed -eq 0 ]]
+}
+
+cmd_status() {
+  echo ""
+  echo "═══ Active Lanes ═══════════════════════════════"
+  local found=0
+  while IFS= read -r container; do
+    local name port worktree branch
+    name="${container#lane-}"
+    # Read actual mapped port from Docker instead of recalculating
+    port="$(docker port "$container" 3000 2>/dev/null | head -1 | sed 's/.*://' || echo '?')"
+    worktree="$(worktree_path "$name")"
+    branch="$(cd "$worktree" 2>/dev/null && git branch --show-current 2>/dev/null || echo '?')"
+    echo "  lane-$name   branch: $branch   port: $port   worktree: $worktree"
+    found=1
+  done < <(docker ps --filter "name=^lane-" --format "{{.Names}}" 2>/dev/null | sort)
+
+  if [[ $found -eq 0 ]]; then
+    echo "  (no lanes running)"
+    echo ""
+    echo "  Start one:  lane start 1"
+  fi
+
+  echo ""
+  echo "═══ All Worktrees ══════════════════════════════"
+  git -C "$REPO_ROOT" worktree list 2>/dev/null
+  echo ""
+}
+
+# ── Dispatch ──────────────────────────────────────────────────────────────────
+
+CMD="${1:-status}"
+shift || true
+
+case "$CMD" in
+  start)   cmd_start "$@" ;;
+  open)    [[ -z "${1:-}" ]] && die "Usage: lane open <name> [branch]"; cmd_start "$@"; cmd_attach "${1}" ;;
+  restart) [[ -z "${1:-}" ]] && die "Usage: lane restart <name>"; cmd_stop "$1"; cmd_start "$1" ;;
+  attach)  cmd_attach "$@" ;;
+  stop)    cmd_stop "$@" ;;
+  rm)      cmd_rm "$@" ;;
+  branch)  cmd_branch "$@" ;;
+  sync)    cmd_sync "$@" ;;
+  status)  cmd_status ;;
+  *)       die "Unknown command: $CMD. Use: open | start | restart | attach | stop | rm | branch | sync | status" ;;
+esac

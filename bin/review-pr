@@ -1,0 +1,353 @@
+#!/usr/bin/env bash
+# review-pr — AI-powered PR review using Claude CLI (subscription auth)
+#
+# Usage:
+#   devtools review-pr              # review all open PRs (all 4 reviewers)
+#   devtools review-pr 18           # review a specific PR
+#   devtools review-pr --approve 18 # review + approve if no issues
+#   devtools review-pr --deep 18    # (legacy alias, now default)
+#   devtools review-pr --skip-test-coverage 18  # skip test coverage reviewer
+#   devtools review-pr --skip-file-org 18       # skip file organization reviewer
+#
+# Reviewers (all run in parallel):
+#   1. Sonnet correctness — bugs, security, error handling, data integrity
+#   2. Opus complexity — unnecessary complexity, overengineering, scope creep
+#   3. Sonnet test coverage — missing tests for changed code
+#   4. Sonnet file organization — structural problems, repo hygiene
+#
+# Requires: claude CLI (authenticated), gh CLI (authenticated)
+# Cost: $0 — uses your Claude subscription, not API tokens
+
+set -eo pipefail
+
+LIB_DIR="$(cd "$(dirname "$0")/../lib" && pwd)"
+source "${LIB_DIR}/config.sh"
+source "${LIB_DIR}/helpers.sh"
+source "${LIB_DIR}/agents.sh"
+
+cd "$REPO_ROOT"
+
+MAX_CONTEXT_BYTES="${MAX_CONTEXT_BYTES:-600000}"  # ~150K tokens — leaves room for prompt + response in 200K window
+
+# ── Temp file cleanup ────────────────────────────────────────────────────────
+
+# Only set EXIT trap when run directly (not sourced)
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  trap cleanup_temp EXIT
+fi
+
+# ── Default values (can be overridden by sourcing script before calling main) ─
+
+AUTO_APPROVE="${AUTO_APPROVE:-false}"
+SKIP_TEST_COVERAGE="${SKIP_TEST_COVERAGE:-false}"
+SKIP_FILE_ORG="${SKIP_FILE_ORG:-false}"
+PR_NUMBER="${PR_NUMBER:-}"
+
+# ── Shared JSON output format for review prompts ────────────────────────────
+
+OUTPUT_FORMAT='Output ONLY valid JSON (no markdown fencing, no extra text):
+{
+  "summary": "1-2 sentence overall assessment",
+  "issues": [
+    {
+      "file": "src/path/to/file.ts",
+      "line": 42,
+      "severity": "critical|warning|info",
+      "message": "What is wrong and how to fix it"
+    }
+  ],
+  "verdict": "approve|request_changes|comment"
+}
+
+If there are no issues, return {"summary": "...", "issues": [], "verdict": "approve"}.'
+
+# ── Get PR list ──────────────────────────────────────────────────────────────
+
+get_prs() {
+  if [[ -n "$PR_NUMBER" ]]; then
+    echo "$PR_NUMBER"
+  else
+    gh pr list --state open --json number --jq '.[].number'
+  fi
+}
+
+# ── Build review context for a single PR ─────────────────────────────────────
+
+build_context() {
+  local pr="$1"
+  local context_file
+  context_file=$(mktemp)
+  TEMP_FILES+=("$context_file")
+
+  # PR metadata
+  local pr_json
+  pr_json=$(gh pr view "$pr" --json title,body,headRefName,baseRefName,files)
+  local title body head_branch
+  title=$(printf '%s' "$pr_json" | jq -r '.title')
+  body=$(printf '%s' "$pr_json" | jq -r '.body // "No description"')
+  head_branch=$(printf '%s' "$pr_json" | jq -r '.headRefName')
+
+  # Write header safely (no heredoc expansion of user content)
+  printf '# PR #%s: %s\n\n## Description\n%s\n\n## Branch\n%s\n\n' \
+    "$pr" "$title" "$body" "$head_branch" > "$context_file"
+
+  # Append diff
+  printf '## Diff\n' >> "$context_file"
+  gh pr diff "$pr" --patch >> "$context_file" 2>/dev/null || true
+  printf '\n## Changed Files (full content at HEAD)\n' >> "$context_file"
+
+  # Append full content of each changed file (skip deleted files)
+  local files_json
+  files_json=$(printf '%s' "$pr_json" | jq -c '.files[] | {path: .path, status: .status}')
+  while IFS= read -r file_entry; do
+    [[ -z "$file_entry" ]] && continue
+    local file status
+    file=$(printf '%s' "$file_entry" | jq -r '.path')
+    status=$(printf '%s' "$file_entry" | jq -r '.status')
+
+    # Skip deleted files — no content to review at HEAD
+    [[ "$status" == "removed" ]] && continue
+
+    local content
+    content=$(gh api "repos/{owner}/{repo}/contents/${file}?ref=${head_branch}" \
+      --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || echo "[binary or too large]")
+
+    printf '\n### %s\n```\n%s\n```\n' "$file" "$content" >> "$context_file"
+  done <<< "$files_json"
+
+  # Append project rules
+  if [[ -f "$REPO_ROOT/$REVIEW_RULES_FILE" ]]; then
+    printf '\n## Project Rules (%s)\n' "$REVIEW_RULES_FILE" >> "$context_file"
+    head -${REVIEW_RULES_MAX_LINES} "$REPO_ROOT/$REVIEW_RULES_FILE" >> "$context_file"
+  fi
+
+  # Check context size — truncate at line boundary to avoid corrupting UTF-8
+  local size
+  size=$(wc -c < "$context_file" | tr -d ' ')
+  if [[ "$size" -gt "$MAX_CONTEXT_BYTES" ]]; then
+    log "Warning: context is $(( size / 1024 ))KB — truncating to ~$(( MAX_CONTEXT_BYTES / 1024 ))KB"
+    local trimmed
+    trimmed=$(mktemp)
+    TEMP_FILES+=("$trimmed")
+    head -c "$MAX_CONTEXT_BYTES" "$context_file" | sed '$ { /^$/! s/$// }' > "$trimmed"
+    mv "$trimmed" "$context_file"
+  fi
+
+  echo "$context_file"
+}
+
+# ── Post review to GitHub ───────────────────────────────────────────────────
+
+post_review() {
+  local pr="$1"
+  local review_json="$2"
+  local reviewer_name="${3:-Sonnet}"
+
+  local summary verdict issue_count
+  summary=$(printf '%s' "$review_json" | jq -r '.summary')
+  verdict=$(printf '%s' "$review_json" | jq -r '.verdict')
+  issue_count=$(printf '%s' "$review_json" | jq '.issues | length')
+
+  # Map verdict to GitHub review event
+  local event="COMMENT"
+  if [[ "$verdict" == "approve" && "$AUTO_APPROVE" == "true" ]]; then
+    event="APPROVE"
+  elif [[ "$verdict" == "request_changes" ]]; then
+    event="REQUEST_CHANGES"
+  fi
+
+  # Build review body
+  local review_body
+  review_body=$(printf '## %s Review\n\n**%s**\n\n' "$reviewer_name" "$summary")
+  if [[ "$issue_count" -gt 0 ]]; then
+    review_body+=$(printf '### Issues Found (%s)\n\n' "$issue_count")
+    local issues_md
+    issues_md=$(printf '%s' "$review_json" | jq -r '.issues[] | "- **\(.severity)** `\(.file):\(.line)`: \(.message)"')
+    review_body+="$issues_md"
+  else
+    review_body+="No issues found."
+  fi
+
+  # Post the review — fall back to COMMENT if REQUEST_CHANGES fails (e.g. self-authored PR)
+  gh api "repos/{owner}/{repo}/pulls/${pr}/reviews" \
+    -X POST \
+    --field event="$event" \
+    --field body="$review_body" \
+    > /dev/null 2>&1 || {
+      if [[ "$event" != "COMMENT" ]]; then
+        log "(${event} rejected by GitHub — falling back to COMMENT)"
+        gh api "repos/{owner}/{repo}/pulls/${pr}/reviews" \
+          -X POST \
+          --field event="COMMENT" \
+          --field body="$review_body" \
+          > /dev/null || err "Failed to post ${reviewer_name} review to GitHub (PR #${pr})"
+      else
+        err "Failed to post ${reviewer_name} review to GitHub (PR #${pr})"
+      fi
+    }
+
+  log "Posted review: ${verdict} (${issue_count} issues)"
+
+  # Post inline comments — attempt each, let API reject invalid lines
+  if [[ "$issue_count" -gt 0 ]]; then
+    local commit_sha
+    commit_sha=$(gh pr view "$pr" --json headRefOid --jq '.headRefOid')
+
+    printf '%s' "$review_json" | jq -c '.issues[]' | while IFS= read -r issue; do
+      local file line message severity
+      file=$(printf '%s' "$issue" | jq -r '.file')
+      line=$(printf '%s' "$issue" | jq -r '.line')
+      message=$(printf '%s' "$issue" | jq -r '.message')
+      severity=$(printf '%s' "$issue" | jq -r '.severity')
+
+      [[ "$line" == "null" || "$line" == "0" ]] && continue
+
+      local icon="info"
+      [[ "$severity" == "warning" ]]  && icon="warning"
+      [[ "$severity" == "critical" ]] && icon="CRITICAL"
+
+      gh api "repos/{owner}/{repo}/pulls/${pr}/comments" \
+        -X POST \
+        --field body="**${reviewer_name} Review** [\`${icon}\`]: ${message}" \
+        --field path="$file" \
+        --field line="$line" \
+        --field side="RIGHT" \
+        --field commit_id="$commit_sha" \
+        > /dev/null 2>&1 || log "  (inline comment skipped: ${file}:${line} not in diff)"
+    done
+  fi
+}
+
+# ── Run a review pass ────────────────────────────────────────────────────────
+
+run_review() {
+  local pr="$1"
+  local prompt="$2"
+  local model="$3"
+  local reviewer_name="$4"
+  local context_file="$5"
+
+  info "PR #${pr}: Running ${reviewer_name} review..."
+
+  local review_output review_stderr
+  review_stderr=$(mktemp)
+  TEMP_FILES+=("$review_stderr")
+
+  review_output=$(env -u CLAUDECODE claude -p "${prompt}
+
+$(cat "$context_file")" \
+    --model "$model" \
+    --output-format text \
+    --max-turns 1 \
+    2>"$review_stderr") || {
+      err "${reviewer_name} review failed for PR #${pr}:"
+      cat "$review_stderr" >&2
+      return 1
+    }
+
+  local review_json
+  review_json=$(parse_review_json "$review_output")
+
+  if [[ -z "$review_json" ]]; then
+    err "Failed to parse ${reviewer_name} output for PR #${pr}"
+    log "Raw output (first 500 chars): ${review_output:0:500}"
+    return 1
+  fi
+
+  local verdict issue_count
+  verdict=$(printf '%s' "$review_json" | jq -r '.verdict')
+  issue_count=$(printf '%s' "$review_json" | jq '.issues | length')
+
+  if [[ "$issue_count" -eq 0 ]]; then
+    info "PR #${pr}: ${reviewer_name} — Clean — ${verdict}"
+  else
+    info "PR #${pr}: ${reviewer_name} — ${issue_count} issues — ${verdict}"
+  fi
+
+  post_review "$pr" "$review_json" "$reviewer_name"
+}
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+main() {
+  # Parse args only when run directly (not sourced)
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --approve)             AUTO_APPROVE=true;         shift ;;
+      --deep)                shift ;;  # legacy alias, now default behavior
+      --skip-test-coverage)  SKIP_TEST_COVERAGE=true;   shift ;;
+      --skip-file-org)       SKIP_FILE_ORG=true;        shift ;;
+      *)                     PR_NUMBER="$1";            shift ;;
+    esac
+  done
+
+  check_deps claude gh jq
+
+  local prs
+  prs=$(get_prs)
+
+  if [[ -z "$prs" ]]; then
+    info "No open PRs to review."
+    exit 0
+  fi
+
+  # Load agent prompts and append OUTPUT_FORMAT to each
+  local REVIEW_PROMPT OPUS_PROMPT TEST_COVERAGE_PROMPT FILE_ORG_PROMPT
+  REVIEW_PROMPT="$(load_agent "review-correctness")
+
+${OUTPUT_FORMAT}"
+  OPUS_PROMPT="$(load_agent "review-complexity")
+
+${OUTPUT_FORMAT}"
+  TEST_COVERAGE_PROMPT="$(load_agent "review-test-coverage")
+
+${OUTPUT_FORMAT}"
+  FILE_ORG_PROMPT="$(load_agent "review-file-org")
+
+${OUTPUT_FORMAT}"
+
+  while IFS= read -r pr; do
+    [[ -z "$pr" ]] && continue
+    info "Reviewing PR #${pr}..."
+
+    # Build context once, reuse for all review passes
+    local context_file
+    context_file=$(build_context "$pr")
+    local context_size
+    context_size=$(wc -c < "$context_file" | tr -d ' ')
+    log "Context: $(( context_size / 1024 ))KB (~$(( context_size / 4 / 1000 ))K tokens)"
+
+    # Run all reviewers in parallel
+    run_review "$pr" "$REVIEW_PROMPT" "sonnet" "Sonnet" "$context_file" &
+    local pid_sonnet=$!
+
+    run_review "$pr" "$OPUS_PROMPT" "opus" "Opus Architect" "$context_file" &
+    local pid_opus=$!
+
+    local pid_coverage="" pid_fileorg=""
+
+    if [[ "$SKIP_TEST_COVERAGE" != "true" ]]; then
+      run_review "$pr" "$TEST_COVERAGE_PROMPT" "sonnet" "Test Coverage" "$context_file" &
+      pid_coverage=$!
+    fi
+
+    if [[ "$SKIP_FILE_ORG" != "true" ]]; then
+      run_review "$pr" "$FILE_ORG_PROMPT" "sonnet" "File Organization" "$context_file" &
+      pid_fileorg=$!
+    fi
+
+    # Wait for all reviewers
+    wait "$pid_sonnet" 2>/dev/null || true
+    wait "$pid_opus" 2>/dev/null || true
+    [[ -n "$pid_coverage" ]] && { wait "$pid_coverage" 2>/dev/null || true; }
+    [[ -n "$pid_fileorg" ]] && { wait "$pid_fileorg" 2>/dev/null || true; }
+
+    echo ""
+  done <<< "$prs"
+
+  info "Done."
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi

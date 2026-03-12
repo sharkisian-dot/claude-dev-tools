@@ -1,0 +1,54 @@
+# .devtools.yaml — Project configuration for claude-dev-tools
+#
+# Place this file in the root of your project repo.
+# All paths are relative to the repo root.
+
+project:
+  name: "My Project"
+  test_command: "npm test"
+  build_command: "npm run build"
+  dev_command: "npm run dev"
+  dev_port: 3000
+
+# Lane container configuration
+lane:
+  image: "myproject-dev"
+  worktrees_dir: "../myproject-lanes"
+  dockerfile: "Dockerfile.dev"
+
+# PR review configuration
+review:
+  rules_file: "CLAUDE.md"
+  rules_max_lines: 200
+
+# Relay task runner configuration
+relay:
+  tasks_file: "TASKS.md"
+  lock_dir: ".relay-locks"
+
+# Browser-use test configuration
+browser_tests:
+  manifest: "browser-tests/test-manifest.json"
+  dir: "browser-tests"
+  # Smoke tests to run on every commit (paths relative to dir)
+  smoke_tests:
+    - "test_auth_login.py"
+  # Setup command to run before browser tests (e.g., seed test data)
+  setup_command: ""
+  # Environment variables required for browser tests
+  required_env:
+    - BROWSER_USE_API_KEY
+
+# Gemini integration (optional)
+gemini:
+  tool_path: "tools/gemini_tool.py"
+  requirements: "tools/requirements.txt"
+
+# Hygiene gate thresholds
+hygiene:
+  max_rules_lines: 400
+
+# Project-specific tools registered as plugins
+# plugins:
+#   - path: "scripts/plugins/my-tool.sh"
+#     command: "my-tool"

@@ -51,6 +51,8 @@ hygiene:
 # Static analysis gate (deterministic, runs before LLM gates in relay-race)
 # All commands are optional — only configured commands will run.
 # Commands run on changed files only (git diff --name-only).
+# NOTE: Commands are split on whitespace — do not use quoted arguments
+# (e.g., use a wrapper script instead of inline 'npx eslint --rule "..."').
 static_analysis:
   # Type checking (fails on errors, no auto-fix)
   typecheck_command: "npx tsc --noEmit"

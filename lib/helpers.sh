@@ -89,8 +89,13 @@ duration_log_end() {
   local end_time; end_time=$(date +%s)
   local duration=$(( end_time - _duration_start_time ))
   if [[ -n "$DURATION_LOG_FILE" ]]; then
-    printf '{"label":"%s","model":"%s","duration_s":%d,"timestamp":"%s"}\n' \
-      "$label" "$model" "$duration" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$DURATION_LOG_FILE"
+    if command -v jq >/dev/null 2>&1; then
+      jq -nc --arg l "$label" --arg m "$model" --argjson d "$duration" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{label:$l, model:$m, duration_s:$d, timestamp:$t}' >> "$DURATION_LOG_FILE"
+    else
+      printf '{"label":"%s","model":"%s","duration_s":%d,"timestamp":"%s"}\n' \
+        "$label" "$model" "$duration" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$DURATION_LOG_FILE"
+    fi
   fi
   _duration_start_time=""
 }

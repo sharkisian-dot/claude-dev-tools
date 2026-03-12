@@ -469,13 +469,22 @@ run_task() {
       cat "$stderr_tmp" >&2
       echo "  ⚠️  [${task_id}] Gemini failed — falling back to Claude" | tee -a "$log"
       env -u CLAUDECODE -u ANTHROPIC_API_KEY claude --dangerously-skip-permissions --model "$model" \
-        -p "$prompt" 2>&1 | tee -a "$log"
+        -p "$prompt" 2>&1 | tee -a "$log" || {
+        # Retry once on failure if no done-file (transient error, not partial completion)
+        if [[ ! -f "$done_file" ]]; then
+          echo "  ⚠️  [${task_id}] Fallback also failed — retrying in 30s..." | tee -a "$log"
+          sleep 30
+          env -u CLAUDECODE -u ANTHROPIC_API_KEY claude --dangerously-skip-permissions --model "$model" \
+            -p "$prompt" 2>&1 | tee -a "$log" || \
+            echo "  ✗ [${task_id}] Retry also failed" | tee -a "$log"
+        fi
+      }
     }
     rm -f "$stderr_tmp"
   else
     env -u CLAUDECODE -u ANTHROPIC_API_KEY claude --dangerously-skip-permissions --model "$model" \
       -p "$prompt" 2>&1 | tee -a "$log" || {
-      # Retry once on failure if no done-file was produced (transient error, not partial completion)
+      # Retry once on failure if no done-file (transient error, not partial completion)
       if [[ ! -f "$done_file" ]]; then
         echo "  ⚠️  [${task_id}] Agent failed — retrying in 30s..." | tee -a "$log"
         sleep 30

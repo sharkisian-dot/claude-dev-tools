@@ -309,7 +309,7 @@ mark_done() {
   local task_id="$1"
   # Truncate note to one line so it doesn't corrupt TASKS.md structure
   local note
-  note=$(echo "${2:-completed}" | head -1 | cut -c1-120)
+  note=$(echo "${2:-completed}" | head -1 | cut -c1-50)
   acquire_lock "tasks-write" 60
   # Pass bash vars via env; use single-quoted Perl so $1/$2 are Perl capture groups
   RELAY_TASK_ID="$task_id" RELAY_NOTE="$note" perl -i -0777 -pe '
@@ -802,7 +802,6 @@ while true; do
       [[ $local_remaining -gt 0 ]] && continue
     fi
     # Check for any scout-blocked tasks before declaring victory
-    local_scout_blocked
     local_scout_blocked=$(grep -c '^\- \[B\]' "$TASKS_FILE" 2>/dev/null) || local_scout_blocked=0
     echo ""
     if (( local_scout_blocked > 0 )); then

@@ -66,26 +66,26 @@ Dependencies: `[needs: TASKID]` or `[needs: ID1, ID2]` at end of title line.
 ## Relay Race Flags
 
 ```bash
-relay-race                          # sequential, creates PR
-relay-race --parallel 3             # up to 3 concurrent agents
-relay-race --no-pr                  # commit to current branch
-relay-race --dry-run                # show execution plan
-relay-race --skip-review            # skip Opus review gate
-relay-race --skip-static-analysis   # skip deterministic lint/typecheck gate
-relay-race --skip-browser           # skip browser-use gate
-relay-race --skip-hygiene           # skip hygiene gate
-relay-race --skip-simplify          # skip code simplifier gate
-relay-race --skip-security          # skip security reviewer in PR review
+devtools relay-race                          # sequential, creates PR
+devtools relay-race --parallel 3             # up to 3 concurrent agents
+devtools relay-race --no-pr                  # commit to current branch
+devtools relay-race --dry-run                # show execution plan
+devtools relay-race --skip-review            # skip Opus review gate
+devtools relay-race --skip-static-analysis   # skip deterministic lint/typecheck gate
+devtools relay-race --skip-browser           # skip browser-use gate
+devtools relay-race --skip-hygiene           # skip hygiene gate
+devtools relay-race --skip-simplify          # skip code simplifier gate
+devtools relay-race --skip-security          # skip security reviewer in PR review
 ```
 
 ## Review-PR Flags
 
 ```bash
-review-pr 42                # review PR #42
-review-pr --incremental 42  # only new commits since last review
-review-pr --skip-security 42  # skip security reviewer
-review-pr --skip-test-coverage 42  # skip test coverage reviewer
-review-pr --approve 42      # auto-approve if clean
+devtools review-pr 42                # review PR #42
+devtools review-pr --incremental 42  # only new commits since last review
+devtools review-pr --skip-security 42  # skip security reviewer
+devtools review-pr --skip-test-coverage 42  # skip test coverage reviewer
+devtools review-pr --approve 42      # auto-approve if clean
 ```
 
 ## Quality Gates (relay-race)

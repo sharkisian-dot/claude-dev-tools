@@ -4,11 +4,22 @@ Reusable AI-powered development tooling for multi-agent workflows using Claude C
 
 ## Quick Start
 
+### Option A: Git submodule (recommended)
+
 ```bash
 cd your-project
 git submodule add git@github.com:your-org/claude-dev-tools.git tools/devtools
-cp tools/devtools/.devtools.yaml.example .devtools.yaml
+bash tools/devtools/install.sh
 # Edit .devtools.yaml with your project settings
+```
+
+### Option B: Clone alongside project
+
+```bash
+git clone git@github.com:your-org/claude-dev-tools.git
+cd your-project
+bash ../claude-dev-tools/install.sh
+export PATH="../claude-dev-tools/bin:$PATH"
 ```
 
 ## Tools

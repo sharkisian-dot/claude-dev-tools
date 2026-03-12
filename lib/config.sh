@@ -152,9 +152,16 @@ BROWSER_TESTS_DIR=$(config_get "browser_tests.dir" "browser-tests")
 
 HYGIENE_MAX_RULES_LINES=$(config_get "hygiene.max_rules_lines" "400")
 
+# Static analysis gate configuration (pure bash, no LLM)
+STATIC_ANALYSIS_TYPECHECK=$(config_get "static_analysis.typecheck_command" "")
+STATIC_ANALYSIS_LINT=$(config_get "static_analysis.lint_command" "")
+STATIC_ANALYSIS_LINT_FIX=$(config_get "static_analysis.lint_fix_command" "")
+STATIC_ANALYSIS_FORMAT=$(config_get "static_analysis.format_command" "")
+
 export PROJECT_NAME TEST_COMMAND BUILD_COMMAND DEV_COMMAND DEV_PORT
 export LANE_IMAGE LANE_WORKTREES_DIR LANE_DOCKERFILE
 export REVIEW_RULES_FILE REVIEW_RULES_MAX_LINES
 export RELAY_TASKS_FILE RELAY_LOCK_DIR
 export BROWSER_TESTS_MANIFEST BROWSER_TESTS_DIR
 export HYGIENE_MAX_RULES_LINES
+export STATIC_ANALYSIS_TYPECHECK STATIC_ANALYSIS_LINT STATIC_ANALYSIS_LINT_FIX STATIC_ANALYSIS_FORMAT

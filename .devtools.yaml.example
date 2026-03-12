@@ -48,6 +48,19 @@ gemini:
 hygiene:
   max_rules_lines: 400
 
+# Static analysis gate (deterministic, runs before LLM gates)
+# All commands are optional — only configured commands will run.
+# Commands run on changed files only (git diff --name-only).
+static_analysis:
+  # Type checking (fails on errors, no auto-fix)
+  typecheck_command: "npx tsc --noEmit"
+  # Linting (report only — used to check for unfixable issues)
+  lint_command: "npx eslint --quiet"
+  # Lint auto-fix (runs first, fixes what it can)
+  lint_fix_command: "npx eslint --fix"
+  # Formatting auto-fix
+  format_command: "npx prettier --write"
+
 # Project-specific tools registered as plugins
 # plugins:
 #   - path: "scripts/plugins/my-tool.sh"

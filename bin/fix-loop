@@ -402,6 +402,11 @@ run_round() {
 
   info "Round ${round}: ${issue_count} issues — verdict: ${verdict}"
 
+  # Log issues for cross-run pattern detection
+  if [[ "$issue_count" -gt 0 ]]; then
+    log_review_issues "fix-loop:round${round}" "PR#${PR_NUMBER}" "$merged_file"
+  fi
+
   # Save to history for meta-review
   save_round_review "$round" "$merged_file"
 

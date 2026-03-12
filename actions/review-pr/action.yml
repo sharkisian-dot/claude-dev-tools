@@ -1,0 +1,75 @@
+name: 'AI PR Review'
+description: 'Run devtools review-pr on pull request open/update'
+
+inputs:
+  skip-security:
+    description: 'Skip the security reviewer'
+    required: false
+    default: 'false'
+  skip-test-coverage:
+    description: 'Skip the test coverage reviewer'
+    required: false
+    default: 'false'
+  skip-file-org:
+    description: 'Skip the file organization reviewer'
+    required: false
+    default: 'false'
+  incremental:
+    description: 'Only review new commits since last review'
+    required: false
+    default: 'true'
+  approve:
+    description: 'Auto-approve if no issues found'
+    required: false
+    default: 'false'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Checkout with submodules
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        fetch-depth: 0
+
+    - name: Install Claude CLI
+      shell: bash
+      run: |
+        # Claude CLI must be pre-installed or available in PATH
+        if ! command -v claude >/dev/null 2>&1; then
+          echo "::error::Claude CLI not found. Install it first: npm install -g @anthropic-ai/claude-code"
+          exit 1
+        fi
+
+    - name: Run PR Review
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        PR_NUMBER="${{ github.event.pull_request.number }}"
+        FLAGS=""
+
+        if [[ "${{ inputs.skip-security }}" == "true" ]]; then
+          FLAGS+=" --skip-security"
+        fi
+        if [[ "${{ inputs.skip-test-coverage }}" == "true" ]]; then
+          FLAGS+=" --skip-test-coverage"
+        fi
+        if [[ "${{ inputs.skip-file-org }}" == "true" ]]; then
+          FLAGS+=" --skip-file-org"
+        fi
+        if [[ "${{ inputs.incremental }}" == "true" ]]; then
+          FLAGS+=" --incremental"
+        fi
+        if [[ "${{ inputs.approve }}" == "true" ]]; then
+          FLAGS+=" --approve"
+        fi
+
+        # Use the submodule path or find the devtools binary
+        DEVTOOLS_BIN="tools/devtools/bin/review-pr"
+        if [[ ! -x "$DEVTOOLS_BIN" ]]; then
+          echo "::error::devtools not found at ${DEVTOOLS_BIN}. Ensure git submodules are initialized."
+          exit 1
+        fi
+
+        bash "$DEVTOOLS_BIN" $FLAGS "$PR_NUMBER"

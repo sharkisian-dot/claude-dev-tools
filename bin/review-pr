@@ -8,12 +8,15 @@
 #   devtools review-pr --deep 18    # (legacy alias, now default)
 #   devtools review-pr --skip-test-coverage 18  # skip test coverage reviewer
 #   devtools review-pr --skip-file-org 18       # skip file organization reviewer
+#   devtools review-pr --skip-security 18       # skip security reviewer
+#   devtools review-pr --incremental 18         # only review new commits since last review
 #
 # Reviewers (all run in parallel):
-#   1. Sonnet correctness — bugs, security, error handling, data integrity
+#   1. Sonnet correctness — bugs, error handling, data integrity
 #   2. Opus complexity — unnecessary complexity, overengineering, scope creep
 #   3. Sonnet test coverage — missing tests for changed code
 #   4. Sonnet file organization — structural problems, repo hygiene
+#   5. Sonnet security — vulnerabilities, secrets, auth, injection
 #
 # Requires: claude CLI (authenticated), gh CLI (authenticated)
 # Cost: $0 — uses your Claude subscription, not API tokens
@@ -41,6 +44,7 @@ fi
 AUTO_APPROVE="${AUTO_APPROVE:-false}"
 SKIP_TEST_COVERAGE="${SKIP_TEST_COVERAGE:-false}"
 SKIP_FILE_ORG="${SKIP_FILE_ORG:-false}"
+SKIP_SECURITY="${SKIP_SECURITY:-false}"
 PR_NUMBER="${PR_NUMBER:-}"
 
 # ── Shared JSON output format for review prompts ────────────────────────────
@@ -56,10 +60,16 @@ OUTPUT_FORMAT='Output ONLY valid JSON (no markdown fencing, no extra text):
       "message": "What is wrong and how to fix it"
     }
   ],
+  "review_effort": 3,
+  "security_concerns": true,
   "verdict": "approve|request_changes|comment"
 }
 
-If there are no issues, return {"summary": "...", "issues": [], "verdict": "approve"}.'
+Fields:
+- review_effort: 1-5 scale (1=trivial rename, 2=simple change, 3=moderate feature, 4=complex logic, 5=architectural change). Reflects how carefully this PR needs human review.
+- security_concerns: true if ANY security-relevant code was changed (auth, crypto, user input handling, API keys, permissions). false otherwise.
+
+If there are no issues, return {"summary": "...", "issues": [], "review_effort": N, "security_concerns": false, "verdict": "approve"}.'
 
 # ── Get PR list ──────────────────────────────────────────────────────────────
 
@@ -91,9 +101,15 @@ build_context() {
   printf '# PR #%s: %s\n\n## Description\n%s\n\n## Branch\n%s\n\n' \
     "$pr" "$title" "$body" "$head_branch" > "$context_file"
 
-  # Append diff
+  # Append diff (incremental: only since last reviewed commit)
   printf '## Diff\n' >> "$context_file"
-  gh pr diff "$pr" --patch >> "$context_file" 2>/dev/null || true
+  if [[ -n "${INCREMENTAL_BASE:-}" ]]; then
+    printf '(Incremental: showing changes since %s)\n' "${INCREMENTAL_BASE:0:7}" >> "$context_file"
+    git diff "${INCREMENTAL_BASE}..${head_branch}" >> "$context_file" 2>/dev/null || \
+      gh pr diff "$pr" --patch >> "$context_file" 2>/dev/null || true
+  else
+    gh pr diff "$pr" --patch >> "$context_file" 2>/dev/null || true
+  fi
   printf '\n## Changed Files (full content at HEAD)\n' >> "$context_file"
 
   # Append full content of each changed file (skip deleted files)
@@ -114,6 +130,63 @@ build_context() {
 
     printf '\n### %s\n```\n%s\n```\n' "$file" "$content" >> "$context_file"
   done <<< "$files_json"
+
+  # 80/20 RAG: Find callers/importers of changed files (lightweight cross-reference)
+  # Only adds files that directly import a changed file — no embeddings or vector DB needed
+  if command -v rg >/dev/null 2>&1; then
+    local rag_files=()
+    local rag_bytes=0
+    local rag_limit=$(( MAX_CONTEXT_BYTES / 4 ))  # cap RAG at 25% of context budget
+
+    while IFS= read -r file_entry; do
+      [[ -z "$file_entry" ]] && continue
+      local file status
+      file=$(printf '%s' "$file_entry" | jq -r '.path')
+      status=$(printf '%s' "$file_entry" | jq -r '.status')
+      [[ "$status" == "removed" ]] && continue
+
+      # Extract the importable name (basename without extension)
+      local basename_no_ext
+      basename_no_ext=$(basename "$file" | sed 's/\.[^.]*$//')
+      [[ "$basename_no_ext" == "index" ]] && basename_no_ext=$(basename "$(dirname "$file")")
+
+      # Find files that import this changed file (skip the file itself)
+      local importers
+      importers=$(rg -l --type-add 'code:*.{ts,tsx,js,jsx,py,sh}' -t code \
+        "(import.*['\"].*${basename_no_ext}['\"]|require.*['\"].*${basename_no_ext}['\"]|from.*['\"].*${basename_no_ext}['\"])" \
+        "$REPO_ROOT" 2>/dev/null | grep -v "node_modules" | grep -v "$file" | head -5) || true
+
+      while IFS= read -r importer; do
+        [[ -z "$importer" ]] && continue
+        # Deduplicate and check budget
+        local rel_path="${importer#$REPO_ROOT/}"
+        local already_added=false
+        for existing in "${rag_files[@]:-}"; do
+          [[ "$existing" == "$rel_path" ]] && { already_added=true; break; }
+        done
+        $already_added && continue
+
+        local file_size
+        file_size=$(wc -c < "$importer" 2>/dev/null | tr -d ' ') || continue
+        if [[ $(( rag_bytes + file_size )) -gt $rag_limit ]]; then
+          break 2  # over budget, stop adding
+        fi
+
+        rag_files+=("$rel_path")
+        rag_bytes=$(( rag_bytes + file_size ))
+      done <<< "$importers"
+    done <<< "$files_json"
+
+    if [[ ${#rag_files[@]} -gt 0 ]]; then
+      printf '\n## Callers/Importers of Changed Files (context)\n' >> "$context_file"
+      for rag_file in "${rag_files[@]}"; do
+        local content
+        content=$(cat "$REPO_ROOT/$rag_file" 2>/dev/null || echo "[could not read]")
+        printf '\n### %s (caller)\n```\n%s\n```\n' "$rag_file" "$content" >> "$context_file"
+      done
+      log "RAG context: ${#rag_files[@]} caller files (~$(( rag_bytes / 1024 ))KB)"
+    fi
+  fi
 
   # Append project rules
   if [[ -f "$REPO_ROOT/$REVIEW_RULES_FILE" ]]; then
@@ -277,6 +350,8 @@ main() {
       --deep)                shift ;;  # legacy alias, now default behavior
       --skip-test-coverage)  SKIP_TEST_COVERAGE=true;   shift ;;
       --skip-file-org)       SKIP_FILE_ORG=true;        shift ;;
+      --skip-security)       SKIP_SECURITY=true;        shift ;;
+      --incremental)         INCREMENTAL=true;          shift ;;
       *)                     PR_NUMBER="$1";            shift ;;
     esac
   done
@@ -292,7 +367,7 @@ main() {
   fi
 
   # Load agent prompts and append OUTPUT_FORMAT to each
-  local REVIEW_PROMPT OPUS_PROMPT TEST_COVERAGE_PROMPT FILE_ORG_PROMPT
+  local REVIEW_PROMPT OPUS_PROMPT TEST_COVERAGE_PROMPT FILE_ORG_PROMPT SECURITY_PROMPT
   REVIEW_PROMPT="$(load_agent "review-correctness")
 
 ${OUTPUT_FORMAT}"
@@ -305,10 +380,24 @@ ${OUTPUT_FORMAT}"
   FILE_ORG_PROMPT="$(load_agent "review-file-org")
 
 ${OUTPUT_FORMAT}"
+  SECURITY_PROMPT="$(load_agent "review-security")
+
+${OUTPUT_FORMAT}"
 
   while IFS= read -r pr; do
     [[ -z "$pr" ]] && continue
     info "Reviewing PR #${pr}..."
+
+    # Incremental review: check for previous review marker comment
+    if [[ "${INCREMENTAL:-false}" == "true" ]]; then
+      local last_reviewed_sha
+      last_reviewed_sha=$(gh api "repos/{owner}/{repo}/issues/${pr}/comments" \
+        --jq '[.[] | select(.body | startswith("<!-- devtools-reviewed:")) | .body | capture("<!-- devtools-reviewed:(?<sha>[a-f0-9]+) -->") | .sha] | last // empty' 2>/dev/null)
+      if [[ -n "$last_reviewed_sha" ]]; then
+        info "Incremental mode: reviewing only commits since ${last_reviewed_sha:0:7}"
+        export INCREMENTAL_BASE="$last_reviewed_sha"
+      fi
+    fi
 
     # Build context once, reuse for all review passes
     local context_file
@@ -318,29 +407,44 @@ ${OUTPUT_FORMAT}"
     log "Context: $(( context_size / 1024 ))KB (~$(( context_size / 4 / 1000 ))K tokens)"
 
     # Run all reviewers in parallel
+    local pids=()
+
     run_review "$pr" "$REVIEW_PROMPT" "sonnet" "Sonnet" "$context_file" &
-    local pid_sonnet=$!
+    pids+=($!)
 
     run_review "$pr" "$OPUS_PROMPT" "opus" "Opus Architect" "$context_file" &
-    local pid_opus=$!
-
-    local pid_coverage="" pid_fileorg=""
+    pids+=($!)
 
     if [[ "$SKIP_TEST_COVERAGE" != "true" ]]; then
       run_review "$pr" "$TEST_COVERAGE_PROMPT" "sonnet" "Test Coverage" "$context_file" &
-      pid_coverage=$!
+      pids+=($!)
     fi
 
     if [[ "$SKIP_FILE_ORG" != "true" ]]; then
       run_review "$pr" "$FILE_ORG_PROMPT" "sonnet" "File Organization" "$context_file" &
-      pid_fileorg=$!
+      pids+=($!)
+    fi
+
+    if [[ "$SKIP_SECURITY" != "true" ]]; then
+      run_review "$pr" "$SECURITY_PROMPT" "sonnet" "Security" "$context_file" &
+      pids+=($!)
     fi
 
     # Wait for all reviewers
-    wait "$pid_sonnet" 2>/dev/null || true
-    wait "$pid_opus" 2>/dev/null || true
-    [[ -n "$pid_coverage" ]] && { wait "$pid_coverage" 2>/dev/null || true; }
-    [[ -n "$pid_fileorg" ]] && { wait "$pid_fileorg" 2>/dev/null || true; }
+    for pid in "${pids[@]}"; do
+      wait "$pid" 2>/dev/null || true
+    done
+
+    # Post incremental review marker (tracks which SHA was last reviewed)
+    local head_sha
+    head_sha=$(gh pr view "$pr" --json headRefOid --jq '.headRefOid' 2>/dev/null)
+    if [[ -n "$head_sha" ]]; then
+      gh api "repos/{owner}/{repo}/issues/${pr}/comments" \
+        -X POST \
+        --field body="<!-- devtools-reviewed:${head_sha} -->
+_Review completed at commit ${head_sha:0:7}. Use \`review-pr --incremental\` to review only new commits._" \
+        > /dev/null 2>&1 || true
+    fi
 
     echo ""
   done <<< "$prs"

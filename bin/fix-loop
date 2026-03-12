@@ -30,8 +30,8 @@ source "${LIB_DIR}/config.sh"
 source "${LIB_DIR}/helpers.sh"
 source "${LIB_DIR}/agents.sh"
 
-# Source shared definitions (REVIEW_PROMPT, OPUS_PROMPT, TEST_COVERAGE_PROMPT,
-# FILE_ORG_PROMPT, build_context, check_deps from the devtools review-pr script)
+# Source shared definitions (build_context, post_review, parse_review_json,
+# OUTPUT_FORMAT, etc. from the devtools review-pr script)
 # shellcheck source=bin/review-pr
 source "${BIN_DIR}/review-pr"
 
@@ -44,6 +44,7 @@ MAX_BATCHES=2             # max 2 batches = 6 total rounds
 REVIEW_ONLY=false
 SKIP_TEST_COVERAGE=false
 SKIP_FILE_ORG=false
+SKIP_SECURITY=false
 AUTO_MERGE=true
 PR_NUMBER=""
 
@@ -55,6 +56,7 @@ while [[ $# -gt 0 ]]; do
     --review-only)         REVIEW_ONLY=true;         shift ;;
     --skip-test-coverage)  SKIP_TEST_COVERAGE=true;  shift ;;
     --skip-file-org)       SKIP_FILE_ORG=true;       shift ;;
+    --skip-security)       SKIP_SECURITY=true;       shift ;;
     --no-merge)            AUTO_MERGE=false;         shift ;;
     *)                     PR_NUMBER="$1";           shift ;;
   esac
@@ -370,6 +372,15 @@ run_round() {
       review_files+=("$fileorg_file")
       log "File org reviewer: triggered (new files in diff)"
     fi
+
+    # Security — always on round 1
+    if [[ "$SKIP_SECURITY" != "true" ]]; then
+      local security_file
+      security_file=$(mktemp /tmp/fix-loop-security.XXXXXX)
+      run_review_pass "$SECURITY_PROMPT" "sonnet" "Security" "$context_file" "$security_file" &
+      bg_pids+=($!)
+      review_files+=("$security_file")
+    fi
   fi
 
   # Wait for all reviewers to complete
@@ -469,6 +480,9 @@ ${OUTPUT_FORMAT}"
 
 ${OUTPUT_FORMAT}"
   FILE_ORG_PROMPT="$(load_agent "review-file-org")
+
+${OUTPUT_FORMAT}"
+  SECURITY_PROMPT="$(load_agent "review-security")
 
 ${OUTPUT_FORMAT}"
 

@@ -26,7 +26,7 @@
 #   relay-race --skip-simplify  # skip per-task Code Simplifier gate
 #   relay-race --strict-conflicts  # serialize tasks sharing files (default: warn only)
 #   relay-race --no-auto-merge  # create PR but don't auto-merge
-#   relay-race --skip-vet          # skip vet-debate review gate
+#   relay-race --skip-security     # skip security reviewer in PR review
 
 set -eo pipefail
 cd "$(git rev-parse --show-toplevel)"
@@ -49,7 +49,7 @@ SKIP_TEST_REVIEW_GATE=false
 SKIP_SIMPLIFY_GATE=false
 SKIP_HYGIENE_GATE=false
 SKIP_BROWSER_GATE=false
-SKIP_VET_GATE=false
+SKIP_SECURITY_REVIEWER=false
 PR_MODE=true
 AUTO_MERGE=true
 STRICT_CONFLICTS=false
@@ -71,7 +71,7 @@ while [[ $# -gt 0 ]]; do
     --skip-simplify)     SKIP_SIMPLIFY_GATE=true;    shift ;;
     --skip-hygiene)      SKIP_HYGIENE_GATE=true;     shift ;;
     --skip-browser)      SKIP_BROWSER_GATE=true;     shift ;;
-    --skip-vet)          SKIP_VET_GATE=true;          shift ;;
+    --skip-security)     SKIP_SECURITY_REVIEWER=true;  shift ;;
     --pr)                PR_MODE=true;                shift ;;
     --no-pr)             PR_MODE=false;               shift ;;
     --no-auto-merge)     AUTO_MERGE=false;            shift ;;
@@ -989,30 +989,6 @@ else
   echo "⏭️  Browser-use gate skipped (--skip-browser)"
 fi
 
-# ── Vet debate gate ───────────────────────────────────────────────────────────
-if [[ "$SKIP_VET_GATE" != true ]]; then
-  echo ""
-  echo "🔍 Running vet-debate gate (Claude ↔ Gemini, 3-turn)..."
-  VET_HAS_MUST_FIX=false
-  # Look for devtools version first, fall back to project-local
-  _vet_script=""
-  if [[ -x "${DEVTOOLS_ROOT}/bin/vet-debate" ]]; then
-    _vet_script="${DEVTOOLS_ROOT}/bin/vet-debate"
-  elif [[ -x "${REPO_ROOT}/scripts/vet-debate.sh" ]]; then
-    _vet_script="${REPO_ROOT}/scripts/vet-debate.sh"
-  fi
-  if [[ -n "$_vet_script" ]]; then
-    if ! bash "$_vet_script" --base-commit "${RELAY_BASE_SHA:-main}"; then
-      VET_HAS_MUST_FIX=true
-      echo "  ⚠️  Vet debate found must-fix issues"
-    fi
-  else
-    echo "  ⏭️  vet-debate not found or not executable — skipping"
-  fi
-else
-  echo ""
-  echo "⏭️  Vet debate gate skipped (--skip-vet)"
-fi
 
 # ── PR creation (if --pr mode) ───────────────────────────────────────────────
 if [[ "$PR_MODE" == true ]]; then
@@ -1022,18 +998,12 @@ if [[ "$PR_MODE" == true ]]; then
 
   # Build PR body
   TASK_COUNT=$(grep -c '^\- \[x\]' "$TASKS_FILE" 2>/dev/null || echo "0")
-  VET_SUMMARY=""
-  if [[ -f /tmp/vet-debate/report.json ]]; then
-    VET_SUMMARY=$(python3 -c "import json; d=json.load(open('/tmp/vet-debate/report.json')); print(d.get('summary', 'N/A'))" 2>/dev/null || echo "N/A")
-  fi
 
   PR_BODY="## Relay Run Summary
 - Tasks completed: $TASK_COUNT
-- Vet debate: ${VET_SUMMARY:-skipped}
 
 ## Quality Gates
 - Opus review: $(if [[ "$SKIP_REVIEW_GATE" == true ]]; then echo 'skipped'; else echo 'passed'; fi)
-- Vet debate: $(if [[ "$SKIP_VET_GATE" == true ]]; then echo 'skipped'; elif [[ "$VET_HAS_MUST_FIX" == true ]]; then echo 'MUST-FIX ISSUES'; else echo 'passed'; fi)
 - Browser-use: $(if [[ "$SKIP_BROWSER_GATE" == true ]]; then echo 'skipped'; else echo 'ran'; fi)
 
 Generated with [Claude Code](https://claude.com/claude-code) relay-race"
@@ -1043,10 +1013,7 @@ Generated with [Claude Code](https://claude.com/claude-code) relay-race"
   echo "   PR created: $PR_URL"
   echo "   → Run from terminal: relay-race review-pr $PR_NUMBER"
 
-  if [[ "$VET_HAS_MUST_FIX" == true ]]; then
-    echo ""
-    echo "  ⚠️  PR created with must-fix issues — manual review required"
-  elif [[ "$AUTO_MERGE" == true ]]; then
+  if [[ "$AUTO_MERGE" == true ]]; then
     echo ""
     echo "  Enabling auto-merge..."
     gh pr merge --auto --squash || echo "  ⚠️  Auto-merge requires branch protection rules (enable in GitHub settings)"

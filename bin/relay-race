@@ -607,6 +607,7 @@ run_hygiene_gate() {
   # Compute next HG-N counter
   local existing_hg_count
   existing_hg_count=$(grep -c '^\- \[.\{0,1\}\] \*\*Task HG-[0-9]' "$TASKS_FILE" 2>/dev/null || echo 0)
+  existing_hg_count=${existing_hg_count//[^0-9]/}
   local next_hg=$(( existing_hg_count + 1 ))
 
   local prompt

@@ -457,6 +457,21 @@ main() {
   check_deps claude gh jq
   init_review_history
 
+  # Load review prompts (review-pr defines OUTPUT_FORMAT at top level,
+  # but the prompt vars are local to its main() — we must load them here)
+  REVIEW_PROMPT="$(load_agent "review-correctness")
+
+${OUTPUT_FORMAT}"
+  OPUS_PROMPT="$(load_agent "review-complexity")
+
+${OUTPUT_FORMAT}"
+  TEST_COVERAGE_PROMPT="$(load_agent "review-test-coverage")
+
+${OUTPUT_FORMAT}"
+  FILE_ORG_PROMPT="$(load_agent "review-file-org")
+
+${OUTPUT_FORMAT}"
+
   local max_rounds=$(( BATCH_SIZE * MAX_BATCHES ))
   info "PR #${PR_NUMBER}: Starting fix loop (${BATCH_SIZE} rounds/batch, max ${max_rounds} rounds)"
   echo ""

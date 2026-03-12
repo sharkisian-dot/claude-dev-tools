@@ -112,14 +112,25 @@ build_context() {
   fi
   printf '\n## Changed Files (full content at HEAD)\n' >> "$context_file"
 
-  # Append full content of each changed file (skip deleted files)
+  # Append full content of changed files, prioritized by change magnitude.
+  # High-churn files get full content; low-churn files get diff-only if budget is tight.
   local files_json
-  files_json=$(printf '%s' "$pr_json" | jq -c '.files[] | {path: .path, status: .status}')
+  files_json=$(printf '%s' "$pr_json" | jq -c '.files[] | {path: .path, status: .status, additions: (.additions // 0), deletions: (.deletions // 0)}')
+
+  # Sort files by change magnitude (additions + deletions, descending)
+  local sorted_files
+  sorted_files=$(printf '%s\n' "$files_json" | jq -sc 'sort_by(-(.additions + .deletions))[]' 2>/dev/null) || sorted_files="$files_json"
+
+  local content_budget=$(( MAX_CONTEXT_BYTES / 2 ))   # 50% of budget for file contents
+  local content_used=0
+
   while IFS= read -r file_entry; do
     [[ -z "$file_entry" ]] && continue
-    local file status
+    local file status additions deletions
     file=$(printf '%s' "$file_entry" | jq -r '.path')
     status=$(printf '%s' "$file_entry" | jq -r '.status')
+    additions=$(printf '%s' "$file_entry" | jq -r '.additions // 0')
+    deletions=$(printf '%s' "$file_entry" | jq -r '.deletions // 0')
 
     # Skip deleted files — no content to review at HEAD
     [[ "$status" == "removed" ]] && continue
@@ -128,8 +139,18 @@ build_context() {
     content=$(gh api "repos/{owner}/{repo}/contents/${file}?ref=${head_branch}" \
       --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || echo "[binary or too large]")
 
+    local file_size=${#content}
+
+    # If adding this file would exceed budget, include diff-only for remaining files
+    if [[ $(( content_used + file_size )) -gt $content_budget && $content_used -gt 0 ]]; then
+      printf '\n### %s (diff-only, %d+/%d-)\n' "$file" "$additions" "$deletions" >> "$context_file"
+      printf '_Full content omitted (budget exceeded) — see diff above._\n' >> "$context_file"
+      continue
+    fi
+
     printf '\n### %s\n```\n%s\n```\n' "$file" "$content" >> "$context_file"
-  done <<< "$files_json"
+    content_used=$(( content_used + file_size ))
+  done <<< "$sorted_files"
 
   # 80/20 RAG: Find callers/importers of changed files (lightweight cross-reference)
   # Only adds files that directly import a changed file — no embeddings or vector DB needed

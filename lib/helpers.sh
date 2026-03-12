@@ -67,3 +67,47 @@ cleanup_temp() {
 
 # Call this in scripts that use TEMP_FILES:
 #   trap cleanup_temp EXIT
+
+# ── Duration tracking ────────────────────────────────────────────────────────
+
+# Logs wall-clock duration per LLM invocation to a JSON-lines file.
+# Usage: duration_log_start; ... run claude ...; duration_log_end "label" "model"
+DURATION_LOG_FILE=""
+_duration_start_time=""
+
+duration_log_init() {
+  DURATION_LOG_FILE="${1:-/tmp/devtools-duration-$(date +%s).jsonl}"
+}
+
+duration_log_start() {
+  _duration_start_time=$(date +%s)
+}
+
+duration_log_end() {
+  local label="$1" model="$2"
+  [[ -z "$_duration_start_time" ]] && return
+  local end_time; end_time=$(date +%s)
+  local duration=$(( end_time - _duration_start_time ))
+  if [[ -n "$DURATION_LOG_FILE" ]]; then
+    if command -v jq >/dev/null 2>&1; then
+      jq -nc --arg l "$label" --arg m "$model" --argjson d "$duration" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{label:$l, model:$m, duration_s:$d, timestamp:$t}' >> "$DURATION_LOG_FILE"
+    else
+      printf '{"label":"%s","model":"%s","duration_s":%d,"timestamp":"%s"}\n' \
+        "$label" "$model" "$duration" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$DURATION_LOG_FILE"
+    fi
+  fi
+  _duration_start_time=""
+}
+
+duration_log_summary() {
+  [[ -z "$DURATION_LOG_FILE" || ! -f "$DURATION_LOG_FILE" ]] && return
+  local total_duration=0 entry_count=0
+  while IFS= read -r line; do
+    local dur; dur=$(printf '%s' "$line" | jq -r '.duration_s // 0' 2>/dev/null) || continue
+    total_duration=$(( total_duration + dur ))
+    (( entry_count++ )) || true
+  done < "$DURATION_LOG_FILE"
+  echo "Duration: $entry_count invocations, ${total_duration}s total wall time"
+  echo "Details: $DURATION_LOG_FILE"
+}

@@ -41,6 +41,8 @@ NOT testable in unit tests (requires real browser, real files, real streams):
 ══ STEP 3: Write missing tests ════════════════════════════════════════════════
 For each uncovered route that CAN be tested, write integration tests.
 
+Before writing tests, read 1-2 existing test files in the same directory to match conventions.
+
 ══ STEP 4: Run tests ══════════════════════════════════════════════════════════
 If you wrote any new test files: run {{TEST_COMMAND}}
 All tests must pass. Fix failures before committing.

@@ -17,8 +17,8 @@
 #   lane sync [name]              # merge origin/main into all (or one) lane worktree(s)
 #
 # Authentication:
-#   Claude Max auth is read from ~/.claude on your Mac (mounted read-only).
-#   No API key needed — uses your existing subscription.
+#   Host ~/.claude is bind-mounted read-only into the container.
+#   No in-container auth needed — uses your existing subscription credentials.
 #
 # Port allocation:
 #   Prefers lane-1→3001, lane-2→3002, etc. but auto-finds next free port if taken.
@@ -203,8 +203,7 @@ cmd_start() {
     -p "${port}:3000" \
     -v "${worktree}:/workspace" \
     -v "${git_dir_host}:${git_dir_container_path}" \
-    -v "lane_claude_${name}:/home/dev/.claude" \
-    -v "lane_sessionenv_${name}:/home/dev/.claude/session-env" \
+    -v "${claude_dir}:/home/dev/.claude:ro" \
     -v "${env_file}:/workspace/.env.local:ro" \
     -e "TERM=xterm-256color" \
     -e "LANE_NAME=${name}" \
@@ -221,13 +220,8 @@ cmd_start() {
 
   # ── Post-start verification ──────────────────────────────────────────────────
 
-  # 0. Fix permissions and seed Claude config into the named volume.
-  #    Named volume (lane_claude_<name>) persists across restarts so `claude auth login`
-  #    only needs to happen once per lane, not every restart.
-  docker exec -u root "$container" chown -R dev:dev /home/dev/.claude 2>/dev/null || true
-  # Seed settings.json from host if not already present in the volume
-  docker exec "$container" bash -c "test -f /home/dev/.claude/settings.json" 2>/dev/null \
-    || docker cp "${claude_dir}/settings.json" "${container}:/home/dev/.claude/settings.json" 2>/dev/null || true
+  # 0. Claude auth: bind-mounted from host ~/.claude (read-only).
+  #    No in-container auth needed — uses host credentials automatically.
   # Write minimal .claude.json to skip onboarding wizard
   docker exec "$container" bash -c "python3 -c \"
 import json, os
@@ -308,12 +302,7 @@ echo 'cat /home/dev/.bash_motd 2>/dev/null || true' >> /home/dev/.bashrc" 2>/dev
     echo "     GITHUB_TOKEN not set — agents cannot git push directly"
     echo "     Set it with: export GITHUB_TOKEN=<token> before running lane start"
   fi
-  # Check if this lane has Claude credentials persisted in its named volume
-  if docker exec "$container" bash -c "test -f /home/dev/.claude/.credentials.json" 2>/dev/null; then
-    echo "     Claude auth: ✓ credentials found (persisted in volume)"
-  else
-    echo "     Claude auth: run 'claude auth login' inside container (one-time setup)"
-  fi
+  echo "     Claude auth: ✓ bind-mounted from host ~/.claude (read-only)"
 }
 
 cmd_attach() {

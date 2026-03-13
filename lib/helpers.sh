@@ -127,12 +127,8 @@ log_review_issues() {
     '{source:$src, pr:$pr, verdict:.verdict, issues:[.issues[] | {file, severity, message}], timestamp:$t}' \
     2>/dev/null) || { warn "log_review_issues: failed to parse JSON from $json_source"; return; }
 
-  # Use flock for atomic append from parallel subshells
-  if command -v flock >/dev/null 2>&1; then
-    flock -x "$log_file" -c "printf '%s\n' '$log_line' >> '$log_file'"
-  else
-    printf '%s\n' "$log_line" >> "$log_file"
-  fi
+  # Append — >> is atomic for lines under PIPE_BUF on POSIX systems
+  printf '%s\n' "$log_line" >> "$log_file"
 }
 
 # ── PR size check ─────────────────────────────────────────────────────────────

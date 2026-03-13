@@ -84,7 +84,7 @@ while [[ $# -gt 0 ]]; do
     --resume)            RESUME_MODE=true;              shift ;;
     --tasks)             TASKS_FILE="$2";             shift 2 ;;
     -h|--help)
-      sed -n '2,25p' "$0" | grep '^#' | sed 's/^# \?//'
+      sed -n '2,32p' "$0" | grep '^#' | sed 's/^# \?//'
       exit 0 ;;
     *) echo "Unknown option: $1  (use --help)"; exit 1 ;;
   esac
@@ -883,33 +883,27 @@ init_relay_state() {
     --arg tasks "$TASKS_FILE" \
     --argjson parallel "${MAX_PARALLEL:-1}" \
     --argjson pr_mode "$(if [[ "$PR_MODE" == true ]]; then echo true; else echo false; fi)" \
-    '{started_at:$t, relay_branch:$branch, relay_base_sha:$base, tasks_file:$tasks, parallel:$parallel, pr_mode:$pr_mode, skip_flags:{review:false,browser:false,static_analysis:false,hygiene:false,critique:false}, completed_tasks:[], failed_tasks:[], current_phase:"tasks", gates_completed:[]}' \
+    --argjson skip_review "$(if [[ "$SKIP_REVIEW_GATE" == true ]]; then echo true; else echo false; fi)" \
+    --argjson skip_browser "$(if [[ "$SKIP_BROWSER_GATE" == true ]]; then echo true; else echo false; fi)" \
+    --argjson skip_static "$(if [[ "$SKIP_STATIC_ANALYSIS" == true ]]; then echo true; else echo false; fi)" \
+    --argjson skip_hygiene "$(if [[ "$SKIP_HYGIENE_GATE" == true ]]; then echo true; else echo false; fi)" \
+    --argjson skip_critique "$(if [[ "$SKIP_CRITIQUE_GATE" == true ]]; then echo true; else echo false; fi)" \
+    --argjson skip_security "$(if [[ "$SKIP_SECURITY_REVIEWER" == true ]]; then echo true; else echo false; fi)" \
+    '{started_at:$t, relay_branch:$branch, relay_base_sha:$base, tasks_file:$tasks, parallel:$parallel, pr_mode:$pr_mode, skip_flags:{review:$skip_review,browser:$skip_browser,static_analysis:$skip_static,hygiene:$skip_hygiene,critique:$skip_critique,security:$skip_security}, completed_tasks:[], failed_tasks:[], current_phase:"tasks", gates_completed:[]}' \
     > "$RELAY_STATE_FILE"
 }
 
-save_task_completed() {
-  local task_id="$1"
+# Generic state update — all save_* functions delegate here
+_update_state() {
+  local jq_expr="$1"
   local tmp; tmp=$(mktemp)
-  jq --arg id "$task_id" '.completed_tasks += [$id]' "$RELAY_STATE_FILE" > "$tmp" && mv "$tmp" "$RELAY_STATE_FILE"
+  jq "$jq_expr" "$RELAY_STATE_FILE" > "$tmp" && mv "$tmp" "$RELAY_STATE_FILE"
 }
 
-save_task_failed() {
-  local task_id="$1"
-  local tmp; tmp=$(mktemp)
-  jq --arg id "$task_id" '.failed_tasks += [$id]' "$RELAY_STATE_FILE" > "$tmp" && mv "$tmp" "$RELAY_STATE_FILE"
-}
-
-save_phase() {
-  local phase="$1"
-  local tmp; tmp=$(mktemp)
-  jq --arg p "$phase" '.current_phase = $p' "$RELAY_STATE_FILE" > "$tmp" && mv "$tmp" "$RELAY_STATE_FILE"
-}
-
-save_gate_completed() {
-  local gate="$1"
-  local tmp; tmp=$(mktemp)
-  jq --arg g "$gate" '.gates_completed += [$g]' "$RELAY_STATE_FILE" > "$tmp" && mv "$tmp" "$RELAY_STATE_FILE"
-}
+save_task_completed() { _update_state --arg id "$1" '.completed_tasks += [$id]'; }
+save_task_failed()    { _update_state --arg id "$1" '.failed_tasks += [$id]'; }
+save_phase()          { _update_state --arg p "$1" '.current_phase = $p'; }
+save_gate_completed() { _update_state --arg g "$1" '.gates_completed += [$g]'; }
 
 is_task_done() {
   local task_id="$1"
@@ -928,14 +922,48 @@ load_resume_state() {
   fi
   RELAY_STATE_FILE="$state_file"
 
-  # Restore key variables from state
+  # Restore key variables from state (CLI args take precedence if set)
   RELAY_BRANCH=$(jq -r '.relay_branch' "$state_file")
   RELAY_BASE_SHA=$(jq -r '.relay_base_sha' "$state_file")
-  TASKS_FILE=$(jq -r '.tasks_file' "$state_file")
+
+  # Only restore TASKS_FILE from state if not overridden by CLI --tasks
+  local state_tasks
+  state_tasks=$(jq -r '.tasks_file' "$state_file")
+  if [[ "$TASKS_FILE" == "TASKS.md" ]]; then
+    # Default value — use state file's value
+    TASKS_FILE="$state_tasks"
+  fi
+
+  # Restore run config flags from state
+  MAX_PARALLEL=$(jq -r '.parallel // 1' "$state_file")
+  [[ "$(jq -r '.skip_flags.review // false' "$state_file")" == "true" ]] && SKIP_REVIEW_GATE=true
+  [[ "$(jq -r '.skip_flags.browser // false' "$state_file")" == "true" ]] && SKIP_BROWSER_GATE=true
+  [[ "$(jq -r '.skip_flags.static_analysis // false' "$state_file")" == "true" ]] && SKIP_STATIC_ANALYSIS=true
+  [[ "$(jq -r '.skip_flags.hygiene // false' "$state_file")" == "true" ]] && SKIP_HYGIENE_GATE=true
+  [[ "$(jq -r '.skip_flags.critique // false' "$state_file")" == "true" ]] && SKIP_CRITIQUE_GATE=true
+  [[ "$(jq -r '.skip_flags.security // false' "$state_file")" == "true" ]] && SKIP_SECURITY_REVIEWER=true
+  [[ "$(jq -r '.pr_mode // false' "$state_file")" == "true" ]] && PR_MODE=true
+
+  # Validate TASKS_FILE stays within project directory
+  local resolved_tasks
+  resolved_tasks=$(realpath -m "$TASKS_FILE" 2>/dev/null)
+  local repo_root
+  repo_root=$(git rev-parse --show-toplevel 2>/dev/null)
+  if [[ -n "$resolved_tasks" && -n "$repo_root" && "$resolved_tasks" != "$repo_root"/* ]]; then
+    die "Restored TASKS_FILE escapes repo root: $TASKS_FILE"
+  fi
+
+  # Validate RELAY_BRANCH matches safe pattern
+  if [[ -n "$RELAY_BRANCH" && "$RELAY_BRANCH" != "null" ]]; then
+    if [[ ! "$RELAY_BRANCH" =~ ^[a-zA-Z0-9/_.-]+$ ]]; then
+      die "Invalid relay branch name in state file: $RELAY_BRANCH"
+    fi
+  fi
 
   local completed_count
   completed_count=$(jq '.completed_tasks | length' "$state_file")
   info "Resuming relay: ${completed_count} tasks already completed"
+  info "Restored config: --parallel ${MAX_PARALLEL}"
 
   # Switch to the relay branch if it exists
   if [[ -n "$RELAY_BRANCH" && "$RELAY_BRANCH" != "null" ]]; then
@@ -949,8 +977,8 @@ TOTAL_LAUNCHED=0
 
 if [[ "$RESUME_MODE" == true ]]; then
   RELAY_BASE_SHA=""  # will be restored by load_resume_state
-  duration_log_init "$LOCK_DIR/duration-report.jsonl"
   load_resume_state
+  duration_log_init "$LOCK_DIR/duration-report.jsonl"  # after load_resume_state so existing log is preserved
 else
   RELAY_BASE_SHA=$(git rev-parse HEAD)   # snapshot before any relay commits
 
@@ -1255,23 +1283,25 @@ if [[ "$SKIP_BROWSER_GATE" != true ]]; then
     echo ""
     echo "⏭️  Browser-use gate already completed (resume)"
   else
-  echo ""
-  echo "🌐 Running browser-use smart test picker..."
-  # Look for devtools version first, fall back to project-local
-  _pick_script=""
-  if [[ -x "${DEVTOOLS_ROOT}/bin/pick-browser-tests" ]]; then
-    _pick_script="${DEVTOOLS_ROOT}/bin/pick-browser-tests"
-  elif [[ -x "${REPO_ROOT}/scripts/pick-browser-tests.sh" ]]; then
-    _pick_script="${REPO_ROOT}/scripts/pick-browser-tests.sh"
-  fi
-  if [[ -n "$_pick_script" ]]; then
-    bash "$_pick_script" --base "${RELAY_BASE_SHA:-main}" || {
-      echo "  ⚠️  Browser-use gate failed (exit $?) — see output above"
-    }
-  else
-    echo "  ⏭️  pick-browser-tests not found or not executable — skipping"
-  fi
-  save_gate_completed "browser"
+    echo ""
+    echo "🌐 Running browser-use smart test picker..."
+    # Look for devtools version first, fall back to project-local
+    _pick_script=""
+    if [[ -x "${DEVTOOLS_ROOT}/bin/pick-browser-tests" ]]; then
+      _pick_script="${DEVTOOLS_ROOT}/bin/pick-browser-tests"
+    elif [[ -x "${REPO_ROOT}/scripts/pick-browser-tests.sh" ]]; then
+      _pick_script="${REPO_ROOT}/scripts/pick-browser-tests.sh"
+    fi
+    if [[ -n "$_pick_script" ]]; then
+      if bash "$_pick_script" --base "${RELAY_BASE_SHA:-main}"; then
+        save_gate_completed "browser"
+      else
+        echo "  ⚠️  Browser-use gate failed (exit $?) — see output above"
+      fi
+    else
+      echo "  ⏭️  pick-browser-tests not found or not executable — skipping"
+      save_gate_completed "browser"
+    fi
   fi
 else
   echo ""

@@ -10,6 +10,8 @@
 #   devtools review-pr --skip-file-org 18       # skip file organization reviewer
 #   devtools review-pr --skip-security 18       # skip security reviewer
 #   devtools review-pr --incremental 18         # only review new commits since last review
+#   devtools review-pr --max-diff-lines 1200 18 # adjust max diff line threshold
+#   devtools review-pr --force 18              # review even if diff exceeds limit
 #
 # Reviewers (all run in parallel):
 #   1. Sonnet correctness — bugs, error handling, data integrity
@@ -46,6 +48,8 @@ SKIP_TEST_COVERAGE="${SKIP_TEST_COVERAGE:-false}"
 SKIP_FILE_ORG="${SKIP_FILE_ORG:-false}"
 SKIP_SECURITY="${SKIP_SECURITY:-false}"
 PR_NUMBER="${PR_NUMBER:-}"
+MAX_DIFF_LINES="${MAX_DIFF_LINES:-800}"
+FORCE_REVIEW="${FORCE_REVIEW:-false}"
 
 # ── Shared JSON output format for review prompts ────────────────────────────
 
@@ -215,6 +219,13 @@ build_context() {
     head -${REVIEW_RULES_MAX_LINES} "$REPO_ROOT/$REVIEW_RULES_FILE" >> "$context_file"
   fi
 
+  # Append review suppressions (patterns the maintainer has explicitly approved)
+  if [[ -f "$REPO_ROOT/$REVIEW_SUPPRESSIONS_FILE" ]]; then
+    printf '\n## Review Suppressions (DO NOT flag these patterns)\n' >> "$context_file"
+    printf 'The maintainer has explicitly approved these patterns. Do NOT report issues matching them:\n\n' >> "$context_file"
+    cat "$REPO_ROOT/$REVIEW_SUPPRESSIONS_FILE" >> "$context_file"
+  fi
+
   # Check context size — truncate at line boundary to avoid corrupting UTF-8
   local size
   size=$(wc -c < "$context_file" | tr -d ' ')
@@ -359,6 +370,13 @@ $(cat "$context_file")" \
   fi
 
   post_review "$pr" "$review_json" "$reviewer_name"
+
+  # Log review metrics
+  local metrics_tmp
+  metrics_tmp=$(mktemp)
+  TEMP_FILES+=("$metrics_tmp")
+  printf '%s' "$review_json" > "$metrics_tmp"
+  log_review_issues "review-pr:${reviewer_name}" "PR#${pr}" "$metrics_tmp"
 }
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -373,6 +391,8 @@ main() {
       --skip-file-org)       SKIP_FILE_ORG=true;        shift ;;
       --skip-security)       SKIP_SECURITY=true;        shift ;;
       --incremental)         INCREMENTAL=true;          shift ;;
+      --max-diff-lines)      MAX_DIFF_LINES="$2";        shift 2 ;;
+      --force)               FORCE_REVIEW=true;           shift ;;
       *)                     PR_NUMBER="$1";            shift ;;
     esac
   done
@@ -408,6 +428,19 @@ ${OUTPUT_FORMAT}"
   while IFS= read -r pr; do
     [[ -z "$pr" ]] && continue
     info "Reviewing PR #${pr}..."
+
+    # PR size check
+    local diff_lines
+    diff_lines=$(gh pr diff "$pr" 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$diff_lines" -gt "$MAX_DIFF_LINES" && "$FORCE_REVIEW" != "true" ]]; then
+      warn "PR #${pr} has ${diff_lines} changed lines (limit: ${MAX_DIFF_LINES})."
+      warn "AI review quality degrades on large diffs. Consider splitting the PR."
+      warn "Use --force to review anyway, or --max-diff-lines N to adjust the limit."
+      continue
+    fi
+    if [[ "$diff_lines" -gt "$MAX_DIFF_LINES" ]]; then
+      warn "PR #${pr}: ${diff_lines} lines (above ${MAX_DIFF_LINES} limit) — reviewing with --force"
+    fi
 
     # Incremental review: check for previous review marker comment
     if [[ "${INCREMENTAL:-false}" == "true" ]]; then

@@ -47,6 +47,8 @@ SKIP_FILE_ORG=false
 SKIP_SECURITY=false
 AUTO_MERGE=true
 PR_NUMBER=""
+MAX_DIFF_LINES="${MAX_DIFF_LINES:-800}"
+FORCE_REVIEW="${FORCE_REVIEW:-false}"
 
 # ── Args ──────────────────────────────────────────────────────────────────────
 
@@ -58,6 +60,8 @@ while [[ $# -gt 0 ]]; do
     --skip-file-org)       SKIP_FILE_ORG=true;       shift ;;
     --skip-security)       SKIP_SECURITY=true;       shift ;;
     --no-merge)            AUTO_MERGE=false;         shift ;;
+    --max-diff-lines)      MAX_DIFF_LINES="$2";     shift 2 ;;
+    --force)               FORCE_REVIEW=true;        shift ;;
     *)                     PR_NUMBER="$1";           shift ;;
   esac
 done
@@ -402,6 +406,9 @@ run_round() {
 
   info "Round ${round}: ${issue_count} issues — verdict: ${verdict}"
 
+  # Log review metrics
+  log_review_issues "fix-loop:round-${round}" "PR#${PR_NUMBER}" "$merged_file"
+
   # Save to history for meta-review
   save_round_review "$round" "$merged_file"
 
@@ -467,6 +474,18 @@ merge_pr() {
 main() {
   check_deps claude gh jq
   init_review_history
+
+  # PR size check
+  local diff_lines
+  diff_lines=$(gh pr diff "$PR_NUMBER" 2>/dev/null | wc -l | tr -d ' ')
+  if [[ "$diff_lines" -gt "$MAX_DIFF_LINES" && "$FORCE_REVIEW" != "true" ]]; then
+    warn "PR #${PR_NUMBER} has ${diff_lines} changed lines (limit: ${MAX_DIFF_LINES})."
+    warn "AI review quality degrades on large diffs. Consider splitting the PR."
+    die "Use --force to proceed anyway, or --max-diff-lines N to adjust the limit."
+  fi
+  if [[ "$diff_lines" -gt "$MAX_DIFF_LINES" ]]; then
+    warn "PR #${PR_NUMBER}: ${diff_lines} lines (above ${MAX_DIFF_LINES} limit) — proceeding with --force"
+  fi
 
   # Load review prompts (review-pr defines OUTPUT_FORMAT at top level,
   # but the prompt vars are local to its main() — we must load them here)

@@ -143,6 +143,7 @@ LANE_DOCKERFILE=$(config_get "lane.dockerfile" "Dockerfile.dev")
 
 REVIEW_RULES_FILE=$(config_get "review.rules_file" "CLAUDE.md")
 REVIEW_RULES_MAX_LINES=$(config_get "review.rules_max_lines" "200")
+REVIEW_SUPPRESSIONS_FILE=$(config_get "review.suppressions_file" ".devtools/review-suppressions.md")
 
 RELAY_TASKS_FILE=$(config_get "relay.tasks_file" "TASKS.md")
 RELAY_LOCK_DIR=$(config_get "relay.lock_dir" ".relay-locks")
@@ -160,7 +161,7 @@ STATIC_ANALYSIS_FORMAT=$(config_get "static_analysis.format_command" "")
 
 export PROJECT_NAME TEST_COMMAND BUILD_COMMAND DEV_COMMAND DEV_PORT
 export LANE_IMAGE LANE_WORKTREES_DIR LANE_DOCKERFILE
-export REVIEW_RULES_FILE REVIEW_RULES_MAX_LINES
+export REVIEW_RULES_FILE REVIEW_RULES_MAX_LINES REVIEW_SUPPRESSIONS_FILE
 export RELAY_TASKS_FILE RELAY_LOCK_DIR
 export BROWSER_TESTS_MANIFEST BROWSER_TESTS_DIR
 export HYGIENE_MAX_RULES_LINES

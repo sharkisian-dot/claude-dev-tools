@@ -100,6 +100,30 @@ duration_log_end() {
   _duration_start_time=""
 }
 
+# ── Review metrics logging ────────────────────────────────────────────────────
+
+# Append review results to .devtools-logs/review-issues.jsonl for cross-run analysis.
+log_review_issues() {
+  local source="$1" pr_ref="$2" json_file="$3"
+  local log_dir="${REPO_ROOT:-.}/.devtools-logs"
+  mkdir -p "$log_dir"
+  local log_file="$log_dir/review-issues.jsonl"
+
+  local issue_count verdict
+  issue_count=$(jq '.issues | length' < "$json_file" 2>/dev/null) || return
+  verdict=$(jq -r '.verdict' < "$json_file" 2>/dev/null) || return
+
+  jq -nc \
+    --arg src "$source" \
+    --arg pr "$pr_ref" \
+    --arg v "$verdict" \
+    --argjson ic "$issue_count" \
+    --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --argjson issues "$(jq '[.issues[] | {file, severity, message}]' < "$json_file" 2>/dev/null || echo '[]')" \
+    '{source:$src, pr:$pr, verdict:$v, issue_count:$ic, issues:$issues, timestamp:$t}' \
+    >> "$log_file"
+}
+
 duration_log_summary() {
   [[ -z "$DURATION_LOG_FILE" || ! -f "$DURATION_LOG_FILE" ]] && return
   local total_duration=0 entry_count=0

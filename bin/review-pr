@@ -219,13 +219,6 @@ build_context() {
     head -${REVIEW_RULES_MAX_LINES} "$REPO_ROOT/$REVIEW_RULES_FILE" >> "$context_file"
   fi
 
-  # Append review suppressions (patterns the maintainer has explicitly approved)
-  if [[ -f "$REPO_ROOT/$REVIEW_SUPPRESSIONS_FILE" ]]; then
-    printf '\n## Review Suppressions (DO NOT flag these patterns)\n' >> "$context_file"
-    printf 'The maintainer has explicitly approved these patterns. Do NOT report issues matching them:\n\n' >> "$context_file"
-    cat "$REPO_ROOT/$REVIEW_SUPPRESSIONS_FILE" >> "$context_file"
-  fi
-
   # Check context size — truncate at line boundary to avoid corrupting UTF-8
   local size
   size=$(wc -c < "$context_file" | tr -d ' ')
@@ -236,6 +229,20 @@ build_context() {
     TEMP_FILES+=("$trimmed")
     head -c "$MAX_CONTEXT_BYTES" "$context_file" | sed '$ { /^$/! s/$// }' > "$trimmed"
     mv "$trimmed" "$context_file"
+  fi
+
+  # Append review suppressions AFTER truncation so they're never cut off
+  if [[ -n "${REVIEW_SUPPRESSIONS_FILE:-}" ]]; then
+    # Validate path stays within REPO_ROOT (prevent path traversal)
+    local resolved_suppression
+    resolved_suppression=$(realpath -m "$REPO_ROOT/$REVIEW_SUPPRESSIONS_FILE" 2>/dev/null)
+    if [[ "$resolved_suppression" == "$REPO_ROOT"/* && -f "$resolved_suppression" ]]; then
+      printf '\n## Review Suppressions (DO NOT flag these patterns)\n' >> "$context_file"
+      printf 'The maintainer has explicitly approved these patterns. Do NOT report issues matching them:\n\n' >> "$context_file"
+      cat "$resolved_suppression" >> "$context_file"
+    elif [[ -n "$resolved_suppression" && "$resolved_suppression" != "$REPO_ROOT"/* ]]; then
+      warn "Suppressions file path escapes repo root — skipping: $REVIEW_SUPPRESSIONS_FILE"
+    fi
   fi
 
   echo "$context_file"
@@ -372,11 +379,7 @@ $(cat "$context_file")" \
   post_review "$pr" "$review_json" "$reviewer_name"
 
   # Log review metrics
-  local metrics_tmp
-  metrics_tmp=$(mktemp)
-  TEMP_FILES+=("$metrics_tmp")
-  printf '%s' "$review_json" > "$metrics_tmp"
-  log_review_issues "review-pr:${reviewer_name}" "PR#${pr}" "$metrics_tmp"
+  printf '%s' "$review_json" | log_review_issues "review-pr:${reviewer_name}" "PR#${pr}" "-"
 }
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -430,17 +433,7 @@ ${OUTPUT_FORMAT}"
     info "Reviewing PR #${pr}..."
 
     # PR size check
-    local diff_lines
-    diff_lines=$(gh pr diff "$pr" 2>/dev/null | wc -l | tr -d ' ')
-    if [[ "$diff_lines" -gt "$MAX_DIFF_LINES" && "$FORCE_REVIEW" != "true" ]]; then
-      warn "PR #${pr} has ${diff_lines} changed lines (limit: ${MAX_DIFF_LINES})."
-      warn "AI review quality degrades on large diffs. Consider splitting the PR."
-      warn "Use --force to review anyway, or --max-diff-lines N to adjust the limit."
-      continue
-    fi
-    if [[ "$diff_lines" -gt "$MAX_DIFF_LINES" ]]; then
-      warn "PR #${pr}: ${diff_lines} lines (above ${MAX_DIFF_LINES} limit) — reviewing with --force"
-    fi
+    check_pr_size "$pr" "$MAX_DIFF_LINES" "$FORCE_REVIEW" "continue" || continue
 
     # Incremental review: check for previous review marker comment
     if [[ "${INCREMENTAL:-false}" == "true" ]]; then

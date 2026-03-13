@@ -476,16 +476,7 @@ main() {
   init_review_history
 
   # PR size check
-  local diff_lines
-  diff_lines=$(gh pr diff "$PR_NUMBER" 2>/dev/null | wc -l | tr -d ' ')
-  if [[ "$diff_lines" -gt "$MAX_DIFF_LINES" && "$FORCE_REVIEW" != "true" ]]; then
-    warn "PR #${PR_NUMBER} has ${diff_lines} changed lines (limit: ${MAX_DIFF_LINES})."
-    warn "AI review quality degrades on large diffs. Consider splitting the PR."
-    die "Use --force to proceed anyway, or --max-diff-lines N to adjust the limit."
-  fi
-  if [[ "$diff_lines" -gt "$MAX_DIFF_LINES" ]]; then
-    warn "PR #${PR_NUMBER}: ${diff_lines} lines (above ${MAX_DIFF_LINES} limit) — proceeding with --force"
-  fi
+  check_pr_size "$PR_NUMBER" "$MAX_DIFF_LINES" "$FORCE_REVIEW" "die"
 
   # Load review prompts (review-pr defines OUTPUT_FORMAT at top level,
   # but the prompt vars are local to its main() — we must load them here)

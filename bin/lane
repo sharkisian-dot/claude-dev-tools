@@ -203,7 +203,7 @@ cmd_start() {
     -p "${port}:3000" \
     -v "${worktree}:/workspace" \
     -v "${git_dir_host}:${git_dir_container_path}" \
-    -v "${claude_dir}:/home/dev/.claude:ro" \
+    -v "${claude_dir}:/home/dev/.claude" \
     -v "${env_file}:/workspace/.env.local:ro" \
     -e "TERM=xterm-256color" \
     -e "LANE_NAME=${name}" \

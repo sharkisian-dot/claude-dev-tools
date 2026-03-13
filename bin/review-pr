@@ -10,6 +10,8 @@
 #   devtools review-pr --skip-file-org 18       # skip file organization reviewer
 #   devtools review-pr --skip-security 18       # skip security reviewer
 #   devtools review-pr --incremental 18         # only review new commits since last review
+#   devtools review-pr --max-diff-lines 1200 18 # adjust max diff line threshold
+#   devtools review-pr --force 18              # review even if diff exceeds limit
 #
 # Reviewers (all run in parallel):
 #   1. Sonnet correctness — bugs, error handling, data integrity
@@ -46,6 +48,8 @@ SKIP_TEST_COVERAGE="${SKIP_TEST_COVERAGE:-false}"
 SKIP_FILE_ORG="${SKIP_FILE_ORG:-false}"
 SKIP_SECURITY="${SKIP_SECURITY:-false}"
 PR_NUMBER="${PR_NUMBER:-}"
+MAX_DIFF_LINES="${MAX_DIFF_LINES:-800}"
+FORCE_REVIEW="${FORCE_REVIEW:-false}"
 
 # ── Shared JSON output format for review prompts ────────────────────────────
 
@@ -227,6 +231,22 @@ build_context() {
     mv "$trimmed" "$context_file"
   fi
 
+  # Append review suppressions AFTER truncation so they're never cut off
+  if [[ -n "${REVIEW_SUPPRESSIONS_FILE:-}" ]]; then
+    # Validate path stays within REPO_ROOT (prevent path traversal)
+    local resolved_suppression
+    resolved_suppression=$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$REPO_ROOT/$REVIEW_SUPPRESSIONS_FILE" 2>/dev/null) \
+      || resolved_suppression=$(realpath "$REPO_ROOT/$REVIEW_SUPPRESSIONS_FILE" 2>/dev/null) \
+      || resolved_suppression=""
+    if [[ -n "$resolved_suppression" && "$resolved_suppression" == "$REPO_ROOT"/* && -f "$resolved_suppression" ]]; then
+      printf '\n## Review Suppressions (DO NOT flag these patterns)\n' >> "$context_file"
+      printf 'The maintainer has explicitly approved these patterns. Do NOT report issues matching them:\n\n' >> "$context_file"
+      cat "$resolved_suppression" >> "$context_file"
+    elif [[ -n "$resolved_suppression" && "$resolved_suppression" != "$REPO_ROOT"/* ]]; then
+      warn "Suppressions file path escapes repo root — skipping: $REVIEW_SUPPRESSIONS_FILE"
+    fi
+  fi
+
   echo "$context_file"
 }
 
@@ -359,6 +379,9 @@ $(cat "$context_file")" \
   fi
 
   post_review "$pr" "$review_json" "$reviewer_name"
+
+  # Log review metrics
+  printf '%s' "$review_json" | log_review_issues "review-pr:${reviewer_name}" "PR#${pr}" "-"
 }
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -373,6 +396,8 @@ main() {
       --skip-file-org)       SKIP_FILE_ORG=true;        shift ;;
       --skip-security)       SKIP_SECURITY=true;        shift ;;
       --incremental)         INCREMENTAL=true;          shift ;;
+      --max-diff-lines)      MAX_DIFF_LINES="$2";        shift 2 ;;
+      --force)               FORCE_REVIEW=true;           shift ;;
       *)                     PR_NUMBER="$1";            shift ;;
     esac
   done
@@ -408,6 +433,9 @@ ${OUTPUT_FORMAT}"
   while IFS= read -r pr; do
     [[ -z "$pr" ]] && continue
     info "Reviewing PR #${pr}..."
+
+    # PR size check
+    check_pr_size "$pr" "$MAX_DIFF_LINES" "$FORCE_REVIEW" "continue" || continue
 
     # Incremental review: check for previous review marker comment
     if [[ "${INCREMENTAL:-false}" == "true" ]]; then

@@ -20,6 +20,7 @@ lane:
 review:
   rules_file: "CLAUDE.md"
   rules_max_lines: 200
+  suppressions_file: ".devtools/review-suppressions.md"  # patterns reviewers should ignore
 
 # Relay task runner configuration
 relay:

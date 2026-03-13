@@ -100,6 +100,64 @@ duration_log_end() {
   _duration_start_time=""
 }
 
+# ── Review metrics logging ────────────────────────────────────────────────────
+
+# Append review results to .devtools-logs/review-issues.jsonl for cross-run analysis.
+# Accepts JSON via file path ($3) or stdin (pass "-" or "/dev/stdin" as $3).
+log_review_issues() {
+  local source="$1" pr_ref="$2" json_source="$3"
+  local log_dir="${REPO_ROOT:-.}/.devtools-logs"
+  mkdir -p "$log_dir"
+  local log_file="$log_dir/review-issues.jsonl"
+
+  # Read JSON from file or stdin
+  local json_content
+  if [[ "$json_source" == "-" || "$json_source" == "/dev/stdin" ]]; then
+    json_content=$(cat)
+  else
+    json_content=$(cat "$json_source" 2>/dev/null) || { warn "log_review_issues: could not read $json_source"; return; }
+  fi
+
+  # Single jq call: extract verdict + issues array, construct the log line
+  local log_line
+  log_line=$(printf '%s' "$json_content" | jq -c \
+    --arg src "$source" \
+    --arg pr "$pr_ref" \
+    --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{source:$src, pr:$pr, verdict:.verdict, issues:[(.issues // [])[] | {file, severity, message}], timestamp:$t}' \
+    2>/dev/null) || { warn "log_review_issues: failed to parse JSON from $json_source"; return; }
+
+  # Append — >> is atomic for lines under PIPE_BUF on POSIX systems
+  printf '%s\n' "$log_line" >> "$log_file"
+}
+
+# ── PR size check ─────────────────────────────────────────────────────────────
+
+# Shared PR size gating. Exits/continues based on FORCE mode.
+# Usage: check_pr_size <pr_number> <max_diff_lines> <force_review> [exit_on_fail]
+#   exit_on_fail: "die" to exit (fix-loop), "continue" to skip (review-pr). Default: "die"
+check_pr_size() {
+  local pr="$1" max_lines="$2" force="$3" on_fail="${4:-die}"
+  local diff_lines
+  diff_lines=$(gh pr diff "$pr" 2>/dev/null | wc -l | tr -d ' ')
+
+  if [[ "$diff_lines" -gt "$max_lines" ]]; then
+    if [[ "$force" != "true" ]]; then
+      warn "PR #${pr} has ${diff_lines} changed lines (limit: ${max_lines})."
+      warn "AI review quality degrades on large diffs. Consider splitting the PR."
+      if [[ "$on_fail" == "die" ]]; then
+        die "Use --force to proceed anyway, or --max-diff-lines N to adjust the limit."
+      else
+        warn "Use --force to review anyway, or --max-diff-lines N to adjust the limit."
+        return 1  # caller should 'continue'
+      fi
+    else
+      warn "PR #${pr}: ${diff_lines} lines (above ${max_lines} limit) — proceeding with --force"
+    fi
+  fi
+  return 0
+}
+
 duration_log_summary() {
   [[ -z "$DURATION_LOG_FILE" || ! -f "$DURATION_LOG_FILE" ]] && return
   local total_duration=0 entry_count=0

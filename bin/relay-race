@@ -896,7 +896,7 @@ init_relay_state() {
 # Generic state update — all save_* functions delegate here
 _update_state() {
   local tmp; tmp=$(mktemp)
-  jq "$@" "$RELAY_STATE_FILE" > "$tmp" && mv "$tmp" "$RELAY_STATE_FILE"
+  jq "$@" "$RELAY_STATE_FILE" > "$tmp" && mv "$tmp" "$RELAY_STATE_FILE" || { rm -f "$tmp"; return 1; }
 }
 
 save_task_completed() { _update_state --arg id "$1" '.completed_tasks += [$id]'; }
@@ -943,15 +943,13 @@ load_resume_state() {
   [[ "$(jq -r '.skip_flags.security // false' "$state_file")" == "true" ]] && SKIP_SECURITY_REVIEWER=true
   [[ "$(jq -r '.pr_mode // false' "$state_file")" == "true" ]] && PR_MODE=true
 
-  # Validate TASKS_FILE stays within project directory
+  # Validate TASKS_FILE stays within project directory (portable: cd + pwd -P)
   local repo_root
   repo_root=$(git rev-parse --show-toplevel 2>/dev/null)
-  # Resolve path portably (works on both GNU and BSD/macOS)
   local resolved_tasks
-  resolved_tasks=$(cd "$repo_root" && python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$TASKS_FILE" 2>/dev/null) \
-    || resolved_tasks=$(cd "$repo_root" && realpath "$TASKS_FILE" 2>/dev/null) \
-    || resolved_tasks=""
-  if [[ -n "$resolved_tasks" && -n "$repo_root" && "$resolved_tasks" != "$repo_root"/* ]]; then
+  resolved_tasks=$(cd "$repo_root" && cd "$(dirname "$TASKS_FILE")" 2>/dev/null && echo "$(pwd -P)/$(basename "$TASKS_FILE")") \
+    || die "Cannot resolve TASKS_FILE path: $TASKS_FILE"
+  if [[ "$resolved_tasks" != "$repo_root"/* ]]; then
     die "Restored TASKS_FILE escapes repo root: $TASKS_FILE"
   fi
 

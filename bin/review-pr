@@ -235,8 +235,10 @@ build_context() {
   if [[ -n "${REVIEW_SUPPRESSIONS_FILE:-}" ]]; then
     # Validate path stays within REPO_ROOT (prevent path traversal)
     local resolved_suppression
-    resolved_suppression=$(realpath -m "$REPO_ROOT/$REVIEW_SUPPRESSIONS_FILE" 2>/dev/null)
-    if [[ "$resolved_suppression" == "$REPO_ROOT"/* && -f "$resolved_suppression" ]]; then
+    resolved_suppression=$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$REPO_ROOT/$REVIEW_SUPPRESSIONS_FILE" 2>/dev/null) \
+      || resolved_suppression=$(realpath "$REPO_ROOT/$REVIEW_SUPPRESSIONS_FILE" 2>/dev/null) \
+      || resolved_suppression=""
+    if [[ -n "$resolved_suppression" && "$resolved_suppression" == "$REPO_ROOT"/* && -f "$resolved_suppression" ]]; then
       printf '\n## Review Suppressions (DO NOT flag these patterns)\n' >> "$context_file"
       printf 'The maintainer has explicitly approved these patterns. Do NOT report issues matching them:\n\n' >> "$context_file"
       cat "$resolved_suppression" >> "$context_file"

@@ -124,7 +124,7 @@ log_review_issues() {
     --arg src "$source" \
     --arg pr "$pr_ref" \
     --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    '{source:$src, pr:$pr, verdict:.verdict, issues:[.issues[] | {file, severity, message}], timestamp:$t}' \
+    '{source:$src, pr:$pr, verdict:.verdict, issues:[(.issues // [])[] | {file, severity, message}], timestamp:$t}' \
     2>/dev/null) || { warn "log_review_issues: failed to parse JSON from $json_source"; return; }
 
   # Append — >> is atomic for lines under PIPE_BUF on POSIX systems

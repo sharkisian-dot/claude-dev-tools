@@ -175,16 +175,23 @@ build_context() {
       local importers
       importers=$(rg -l --type-add 'code:*.{ts,tsx,js,jsx,py,sh}' -t code \
         "(import.*['\"].*${basename_no_ext}['\"]|require.*['\"].*${basename_no_ext}['\"]|from.*['\"].*${basename_no_ext}['\"])" \
-        "$REPO_ROOT" 2>/dev/null | grep -v "node_modules" | grep -v "$file" | head -3) || true
+        "$REPO_ROOT" 2>/dev/null | grep -v "node_modules" | grep -v "$file" | head -5) || true
 
       while IFS= read -r importer; do
         [[ -z "$importer" ]] && continue
-        # Deduplicate and check budget
+        # Deduplicate against already-added RAG files and changed PR files
         local rel_path="${importer#$REPO_ROOT/}"
         local already_added=false
         for existing in "${rag_files[@]:-}"; do
           [[ "$existing" == "$rel_path" ]] && { already_added=true; break; }
         done
+        $already_added && continue
+        while IFS= read -r changed_entry; do
+          [[ -z "$changed_entry" ]] && continue
+          local changed_path
+          changed_path=$(printf '%s' "$changed_entry" | jq -r '.path')
+          [[ "$changed_path" == "$rel_path" ]] && { already_added=true; break; }
+        done <<< "$files_json"
         $already_added && continue
 
         local file_size
@@ -198,66 +205,14 @@ build_context() {
       done <<< "$importers"
     done <<< "$files_json"
 
-    # Second hop: find callers of the first-hop callers
-    local rag_files_2hop=()
-    if [[ ${#rag_files[@]} -gt 0 && $rag_bytes -lt $rag_limit ]]; then
-      local hop1_file
-      for hop1_file in "${rag_files[@]}"; do
-        local hop1_basename_no_ext
-        hop1_basename_no_ext=$(basename "$hop1_file" | sed 's/\.[^.]*$//')
-        [[ "$hop1_basename_no_ext" == "index" ]] && hop1_basename_no_ext=$(basename "$(dirname "$hop1_file")")
-
-        local hop2_importers
-        hop2_importers=$(rg -l --type-add 'code:*.{ts,tsx,js,jsx,py,sh}' -t code \
-          "(import.*['\"].*${hop1_basename_no_ext}['\"]|require.*['\"].*${hop1_basename_no_ext}['\"]|from.*['\"].*${hop1_basename_no_ext}['\"])" \
-          "$REPO_ROOT" 2>/dev/null | grep -v "node_modules" | grep -v "$REPO_ROOT/$hop1_file" | head -3) || true
-
-        while IFS= read -r importer; do
-          [[ -z "$importer" ]] && continue
-          local rel_path="${importer#$REPO_ROOT/}"
-          # Dedup against changed files, first-hop, and already-added second-hop
-          local already_added=false
-          for existing in "${rag_files[@]:-}"; do
-            [[ "$existing" == "$rel_path" ]] && { already_added=true; break; }
-          done
-          $already_added && continue
-          for existing in "${rag_files_2hop[@]:-}"; do
-            [[ "$existing" == "$rel_path" ]] && { already_added=true; break; }
-          done
-          $already_added && continue
-          while IFS= read -r changed_entry; do
-            [[ -z "$changed_entry" ]] && continue
-            local changed_path
-            changed_path=$(printf '%s' "$changed_entry" | jq -r '.path')
-            [[ "$changed_path" == "$rel_path" ]] && { already_added=true; break; }
-          done <<< "$files_json"
-          $already_added && continue
-
-          local file_size
-          file_size=$(wc -c < "$importer" 2>/dev/null | tr -d ' ') || continue
-          if [[ $(( rag_bytes + file_size )) -gt $rag_limit ]]; then
-            break 2  # over budget, stop adding
-          fi
-
-          rag_files_2hop+=("$rel_path")
-          rag_bytes=$(( rag_bytes + file_size ))
-        done <<< "$hop2_importers"
-      done
-    fi
-
-    if [[ ${#rag_files[@]} -gt 0 || ${#rag_files_2hop[@]} -gt 0 ]]; then
+    if [[ ${#rag_files[@]} -gt 0 ]]; then
       printf '\n## Callers/Importers of Changed Files (context)\n' >> "$context_file"
       for rag_file in "${rag_files[@]}"; do
         local content
         content=$(cat "$REPO_ROOT/$rag_file" 2>/dev/null || echo "[could not read]")
         printf '\n### %s (caller)\n```\n%s\n```\n' "$rag_file" "$content" >> "$context_file"
       done
-      for rag_file in "${rag_files_2hop[@]}"; do
-        local content
-        content=$(cat "$REPO_ROOT/$rag_file" 2>/dev/null || echo "[could not read]")
-        printf '\n### %s (2nd-hop caller)\n```\n%s\n```\n' "$rag_file" "$content" >> "$context_file"
-      done
-      log "RAG context: ${#rag_files[@]} caller files + ${#rag_files_2hop[@]} 2nd-hop files (~$(( rag_bytes / 1024 ))KB)"
+      log "RAG context: ${#rag_files[@]} caller files (~$(( rag_bytes / 1024 ))KB)"
     fi
   fi
 

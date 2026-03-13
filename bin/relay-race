@@ -28,6 +28,7 @@
 #   relay-race --strict-conflicts  # serialize tasks sharing files (default: warn only)
 #   relay-race --no-auto-merge  # create PR but don't auto-merge
 #   relay-race --skip-security     # skip security reviewer in PR review
+#   relay-race --resume           # resume interrupted relay from state file
 
 set -eo pipefail
 cd "$(git rev-parse --show-toplevel)"
@@ -55,6 +56,7 @@ SKIP_SECURITY_REVIEWER=false
 PR_MODE=true
 AUTO_MERGE=true
 STRICT_CONFLICTS=false
+RESUME_MODE=false
 TASKS_FILE="${RELAY_TASKS_FILE}"
 LOCK_DIR="${RELAY_LOCK_DIR}"
 RELAY_BRANCH=""
@@ -79,6 +81,7 @@ while [[ $# -gt 0 ]]; do
     --no-pr)             PR_MODE=false;               shift ;;
     --no-auto-merge)     AUTO_MERGE=false;            shift ;;
     --strict-conflicts)  STRICT_CONFLICTS=true;       shift ;;
+    --resume)            RESUME_MODE=true;              shift ;;
     --tasks)             TASKS_FILE="$2";             shift 2 ;;
     -h|--help)
       sed -n '2,25p' "$0" | grep '^#' | sed 's/^# \?//'
@@ -867,19 +870,101 @@ run_static_analysis_gate() {
   fi
 }
 
+# ── State management for crash recovery ───────────────────────────────────────
+
+RELAY_STATE_FILE=""
+
+init_relay_state() {
+  RELAY_STATE_FILE="$LOCK_DIR/relay-state.json"
+  jq -nc \
+    --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg branch "${RELAY_BRANCH:-}" \
+    --arg base "$RELAY_BASE_SHA" \
+    --arg tasks "$TASKS_FILE" \
+    --argjson parallel "${MAX_PARALLEL:-1}" \
+    --argjson pr_mode "$(if [[ "$PR_MODE" == true ]]; then echo true; else echo false; fi)" \
+    '{started_at:$t, relay_branch:$branch, relay_base_sha:$base, tasks_file:$tasks, parallel:$parallel, pr_mode:$pr_mode, skip_flags:{review:false,browser:false,static_analysis:false,hygiene:false,critique:false}, completed_tasks:[], failed_tasks:[], current_phase:"tasks", gates_completed:[]}' \
+    > "$RELAY_STATE_FILE"
+}
+
+save_task_completed() {
+  local task_id="$1"
+  local tmp; tmp=$(mktemp)
+  jq --arg id "$task_id" '.completed_tasks += [$id]' "$RELAY_STATE_FILE" > "$tmp" && mv "$tmp" "$RELAY_STATE_FILE"
+}
+
+save_task_failed() {
+  local task_id="$1"
+  local tmp; tmp=$(mktemp)
+  jq --arg id "$task_id" '.failed_tasks += [$id]' "$RELAY_STATE_FILE" > "$tmp" && mv "$tmp" "$RELAY_STATE_FILE"
+}
+
+save_phase() {
+  local phase="$1"
+  local tmp; tmp=$(mktemp)
+  jq --arg p "$phase" '.current_phase = $p' "$RELAY_STATE_FILE" > "$tmp" && mv "$tmp" "$RELAY_STATE_FILE"
+}
+
+save_gate_completed() {
+  local gate="$1"
+  local tmp; tmp=$(mktemp)
+  jq --arg g "$gate" '.gates_completed += [$g]' "$RELAY_STATE_FILE" > "$tmp" && mv "$tmp" "$RELAY_STATE_FILE"
+}
+
+is_task_done() {
+  local task_id="$1"
+  [[ -f "$RELAY_STATE_FILE" ]] && jq -e --arg id "$task_id" '.completed_tasks | index($id) != null' "$RELAY_STATE_FILE" >/dev/null 2>&1
+}
+
+is_gate_done() {
+  local gate="$1"
+  [[ -f "$RELAY_STATE_FILE" ]] && jq -e --arg g "$gate" '.gates_completed | index($g) != null' "$RELAY_STATE_FILE" >/dev/null 2>&1
+}
+
+load_resume_state() {
+  local state_file="$LOCK_DIR/relay-state.json"
+  if [[ ! -f "$state_file" ]]; then
+    die "No relay state found at $state_file — nothing to resume"
+  fi
+  RELAY_STATE_FILE="$state_file"
+
+  # Restore key variables from state
+  RELAY_BRANCH=$(jq -r '.relay_branch' "$state_file")
+  RELAY_BASE_SHA=$(jq -r '.relay_base_sha' "$state_file")
+  TASKS_FILE=$(jq -r '.tasks_file' "$state_file")
+
+  local completed_count
+  completed_count=$(jq '.completed_tasks | length' "$state_file")
+  info "Resuming relay: ${completed_count} tasks already completed"
+
+  # Switch to the relay branch if it exists
+  if [[ -n "$RELAY_BRANCH" && "$RELAY_BRANCH" != "null" ]]; then
+    git checkout "$RELAY_BRANCH" 2>/dev/null || die "Cannot checkout relay branch: $RELAY_BRANCH"
+  fi
+}
+
 # ── Main execution loop ────────────────────────────────────────────────────────
 pending_gate_pids=()   # PIDs of background gate subshells (test-review + simplify)
 TOTAL_LAUNCHED=0
-RELAY_BASE_SHA=$(git rev-parse HEAD)   # snapshot before any relay commits
 
-# ── Initialize cost tracking ─────────────────────────────────────────────────
-duration_log_init "$LOCK_DIR/duration-report.jsonl"
+if [[ "$RESUME_MODE" == true ]]; then
+  RELAY_BASE_SHA=""  # will be restored by load_resume_state
+  duration_log_init "$LOCK_DIR/duration-report.jsonl"
+  load_resume_state
+else
+  RELAY_BASE_SHA=$(git rev-parse HEAD)   # snapshot before any relay commits
 
-# ── PR mode: create a branch ──────────────────────────────────────────────────
-if [[ "$PR_MODE" == true ]]; then
-  RELAY_BRANCH="relay/$(date +%Y-%m-%d-%H%M%S)"
-  git checkout -b "$RELAY_BRANCH"
-  echo "   PR mode: branch $RELAY_BRANCH created"
+  # ── Initialize cost tracking ───────────────────────────────────────────────
+  duration_log_init "$LOCK_DIR/duration-report.jsonl"
+
+  # ── PR mode: create a branch ────────────────────────────────────────────────
+  if [[ "$PR_MODE" == true ]]; then
+    RELAY_BRANCH="relay/$(date +%Y-%m-%d-%H%M%S)"
+    git checkout -b "$RELAY_BRANCH"
+    echo "   PR mode: branch $RELAY_BRANCH created"
+  fi
+
+  init_relay_state
 fi
 
 echo "🏁 Parallel Relay Race"
@@ -906,6 +991,7 @@ while true; do
         if [[ "$local_summary_lower" == scout:\ skip* ]]; then
           echo "⏭️  [${local_task_id}] Scout skip: $local_summary"
           mark_done "$local_task_id" "$local_summary"
+          save_task_completed "$local_task_id"
           # No commit needed — no code was changed
 
         elif [[ "$local_summary_lower" == scout:\ blocked* ]]; then
@@ -918,11 +1004,13 @@ while true; do
           # Write [B] to TASKS.md (not [x]) so dependents don't unblock
           # and humans/agents can see the decision needed inline
           mark_blocked "$local_task_id" "$local_summary"
+          save_task_failed "$local_task_id"
 
         else
           # ── Normal completion ────────────────────────────────────────
           echo "✅ [${local_task_id}] Done: $local_summary"
           mark_done "$local_task_id" "$local_summary"
+          save_task_completed "$local_task_id"
           local_desc=$(echo "$local_task_line" | sed 's/- \[ \] //' | cut -c1-72)
           do_commit "${local_task_id}: $local_desc"
           if [[ "$SKIP_TEST_REVIEW_GATE" != true || "$SKIP_SIMPLIFY_GATE" != true ]]; then
@@ -937,6 +1025,7 @@ while true; do
         fi
       else
         echo "⚠️  [${local_task_id}] No done-file — may have failed. Check $LOCK_DIR/log-${local_task_id}.txt"
+        save_task_failed "$local_task_id"
       fi
 
       unclaim "$local_task_id"
@@ -989,6 +1078,7 @@ while true; do
       tid=$(task_id_of "$line")
       [[ -z "$tid" ]] && continue
       is_claimed "$tid" && continue
+      is_task_done "$tid" && continue
       deps_satisfied "$line" || continue
       next_id="$tid"
       next_line="$line"
@@ -1100,9 +1190,14 @@ wait 2>/dev/null || true
 rm -rf "$LOCK_DIR"/claim-* "$LOCK_DIR"/*.lock 2>/dev/null || true
 
 # ── Static analysis gate (deterministic, before LLM gates) ───────────────────
+save_phase "gates"
 if [[ "$SKIP_STATIC_ANALYSIS" != true ]]; then
-  if [[ -n "$STATIC_ANALYSIS_TYPECHECK" || -n "$STATIC_ANALYSIS_LINT" || -n "$STATIC_ANALYSIS_FORMAT" ]]; then
+  if is_gate_done "static_analysis"; then
+    echo ""
+    echo "⏭️  Static analysis gate already completed (resume)"
+  elif [[ -n "$STATIC_ANALYSIS_TYPECHECK" || -n "$STATIC_ANALYSIS_LINT" || -n "$STATIC_ANALYSIS_FORMAT" ]]; then
     run_static_analysis_gate
+    save_gate_completed "static_analysis"
   else
     echo ""
     echo "⏭️  Static analysis gate skipped (no commands configured in .devtools.yaml)"
@@ -1114,7 +1209,13 @@ fi
 
 # ── Review gate ───────────────────────────────────────────────────────────────
 if [[ "$SKIP_REVIEW_GATE" != true ]]; then
-  run_review_gate
+  if is_gate_done "review"; then
+    echo ""
+    echo "⏭️  Review gate already completed (resume)"
+  else
+    run_review_gate
+    save_gate_completed "review"
+  fi
 else
   echo ""
   echo "⏭️  Review gate skipped (--skip-review)"
@@ -1122,7 +1223,13 @@ fi
 
 # ── Hygiene gate ──────────────────────────────────────────────────────────────
 if [[ "$SKIP_HYGIENE_GATE" != true ]]; then
-  run_hygiene_gate
+  if is_gate_done "hygiene"; then
+    echo ""
+    echo "⏭️  Hygiene gate already completed (resume)"
+  else
+    run_hygiene_gate
+    save_gate_completed "hygiene"
+  fi
 else
   echo ""
   echo "⏭️  Hygiene gate skipped (--skip-hygiene)"
@@ -1130,7 +1237,13 @@ fi
 
 # ── Critique gate ─────────────────────────────────────────────────────────────
 if [[ "$SKIP_CRITIQUE_GATE" != true ]]; then
-  run_critique_gate
+  if is_gate_done "critique"; then
+    echo ""
+    echo "⏭️  Critique gate already completed (resume)"
+  else
+    run_critique_gate
+    save_gate_completed "critique"
+  fi
 else
   echo ""
   echo "⏭️  Critique gate skipped (--skip-critique)"
@@ -1138,6 +1251,10 @@ fi
 
 # ── Browser-use gate ──────────────────────────────────────────────────────────
 if [[ "$SKIP_BROWSER_GATE" != true ]]; then
+  if is_gate_done "browser"; then
+    echo ""
+    echo "⏭️  Browser-use gate already completed (resume)"
+  else
   echo ""
   echo "🌐 Running browser-use smart test picker..."
   # Look for devtools version first, fall back to project-local
@@ -1154,11 +1271,15 @@ if [[ "$SKIP_BROWSER_GATE" != true ]]; then
   else
     echo "  ⏭️  pick-browser-tests not found or not executable — skipping"
   fi
+  save_gate_completed "browser"
+  fi
 else
   echo ""
   echo "⏭️  Browser-use gate skipped (--skip-browser)"
 fi
 
+
+save_phase "done"
 
 # ── PR creation (if --pr mode) ───────────────────────────────────────────────
 if [[ "$PR_MODE" == true ]]; then

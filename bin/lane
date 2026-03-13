@@ -17,9 +17,8 @@
 #   lane sync [name]              # merge origin/main into all (or one) lane worktree(s)
 #
 # Authentication:
-#   Claude credentials are stored in a named Docker volume (lane_claude_<name>)
-#   that persists across container restarts. On first start, run `claude login`
-#   inside the container (one-time). Credentials survive lane restart/stop/start.
+#   Run `claude setup-token` on your Mac and save to ~/.claude/.container-token
+#   The token is passed as CLAUDE_CODE_OAUTH_TOKEN env var — uses your subscription.
 #
 # Port allocation:
 #   Prefers lane-1→3001, lane-2→3002, etc. but auto-finds next free port if taken.
@@ -41,22 +40,22 @@ DEV_IMAGE="${LANE_IMAGE}"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-# Resolve Claude auth token automatically.
-# Sets ANTHROPIC_AUTH_TOKEN in the current shell if not already set.
+# Resolve Claude OAuth token for containers.
+# Reads from CLAUDE_CODE_OAUTH_TOKEN env var or ~/.claude/.container-token file.
+# Generate with: claude setup-token
 resolve_claude_token() {
-  if [[ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]]; then
+  if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
     return 0  # already set
   fi
-  local creds="${HOME}/.claude/.credentials.json"
-  if [[ -f "$creds" ]]; then
-    local token
-    token="$(python3 -c "import json; print(json.load(open('$creds'))['claudeAiOauth']['accessToken'])" 2>/dev/null)"
-    if [[ -n "$token" ]]; then
-      export ANTHROPIC_AUTH_TOKEN="$token"
-      return 0
-    fi
+  local token_file="${HOME}/.claude/.container-token"
+  if [[ -f "$token_file" ]]; then
+    CLAUDE_CODE_OAUTH_TOKEN="$(cat "$token_file" | tr -d '[:space:]')"
+    export CLAUDE_CODE_OAUTH_TOKEN
+    return 0
   fi
-  echo "⚠  Could not resolve Claude auth token — containers will require manual 'claude auth login'"
+  echo "⚠  No Claude container token found."
+  echo "   Generate one: claude setup-token"
+  echo "   Then save to: ~/.claude/.container-token"
   return 1
 }
 
@@ -204,14 +203,13 @@ cmd_start() {
     -p "${port}:3000" \
     -v "${worktree}:/workspace" \
     -v "${git_dir_host}:${git_dir_container_path}" \
-    -v "lane_claude_${name}:/home/dev/.claude" \
     -v "${env_file}:/workspace/.env.local:ro" \
     -e "TERM=xterm-256color" \
     -e "LANE_NAME=${name}" \
     -e "LANE_BRANCH=${lane_branch}" \
     -e "LANE_MERGE_TARGET=main" \
     ${GITHUB_TOKEN:+-e "GITHUB_TOKEN=${GITHUB_TOKEN}"} \
-    ${ANTHROPIC_AUTH_TOKEN:+-e "ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN}"} \
+    ${CLAUDE_CODE_OAUTH_TOKEN:+-e "CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}"} \
     -e "GIT_AUTHOR_NAME=$(git config user.name 2>/dev/null || echo 'Dev Agent')" \
     -e "GIT_AUTHOR_EMAIL=$(git config user.email 2>/dev/null || echo 'dev@local')" \
     -e "GIT_COMMITTER_NAME=$(git config user.name 2>/dev/null || echo 'Dev Agent')" \
@@ -221,16 +219,15 @@ cmd_start() {
 
   # ── Post-start verification ──────────────────────────────────────────────────
 
-  # 0. Claude auth: named volume persists credentials across restarts.
-  #    On first start, seed settings.json from host. User runs `claude login` once.
+  # 0. Claude auth: CLAUDE_CODE_OAUTH_TOKEN env var handles auth automatically.
+  #    Seed settings.json from host for project-specific permissions.
   docker exec -u root "$container" chown -R dev:dev /home/dev/.claude 2>/dev/null || true
-  if ! docker exec "$container" bash -c "test -f /home/dev/.claude/.credentials.json" 2>/dev/null; then
-    # First start — seed settings from host
-    docker cp "${claude_dir}/settings.json" "${container}:/home/dev/.claude/settings.json" 2>/dev/null || true
-    docker exec -u root "$container" chown -R dev:dev /home/dev/.claude 2>/dev/null || true
-    echo "⚠  First start — run 'claude login' inside the container (one-time setup)"
+  docker cp "${claude_dir}/settings.json" "${container}:/home/dev/.claude/settings.json" 2>/dev/null || true
+  docker exec -u root "$container" chown -R dev:dev /home/dev/.claude 2>/dev/null || true
+  if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+    echo "✓ Claude auth via OAuth token"
   else
-    echo "✓ Claude credentials found (persisted in volume)"
+    echo "⚠  No CLAUDE_CODE_OAUTH_TOKEN — run 'claude setup-token' on host"
   fi
 
   # Write minimal .claude.json to skip onboarding wizard
@@ -313,10 +310,10 @@ echo 'cat /home/dev/.bash_motd 2>/dev/null || true' >> /home/dev/.bashrc" 2>/dev
     echo "     GITHUB_TOKEN not set — agents cannot git push directly"
     echo "     Set it with: export GITHUB_TOKEN=<token> before running lane start"
   fi
-  if docker exec "$container" bash -c "test -f /home/dev/.claude/.credentials.json" 2>/dev/null; then
-    echo "     Claude auth: ✓ credentials found (persisted in volume)"
+  if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+    echo "     Claude auth: ✓ OAuth token (uses your subscription)"
   else
-    echo "     Claude auth: ⚠  run 'claude login' inside container (one-time)"
+    echo "     Claude auth: ⚠  missing — run 'claude setup-token' on host, save to ~/.claude/.container-token"
   fi
 }
 

@@ -17,8 +17,9 @@
 #   lane sync [name]              # merge origin/main into all (or one) lane worktree(s)
 #
 # Authentication:
-#   Host ~/.claude is copied into the container on start.
-#   No in-container auth needed — uses your existing subscription credentials.
+#   Claude credentials are stored in a named Docker volume (lane_claude_<name>)
+#   that persists across container restarts. On first start, run `claude login`
+#   inside the container (one-time). Credentials survive lane restart/stop/start.
 #
 # Port allocation:
 #   Prefers lane-1→3001, lane-2→3002, etc. but auto-finds next free port if taken.
@@ -203,6 +204,7 @@ cmd_start() {
     -p "${port}:3000" \
     -v "${worktree}:/workspace" \
     -v "${git_dir_host}:${git_dir_container_path}" \
+    -v "lane_claude_${name}:/home/dev/.claude" \
     -v "${env_file}:/workspace/.env.local:ro" \
     -e "TERM=xterm-256color" \
     -e "LANE_NAME=${name}" \
@@ -219,12 +221,17 @@ cmd_start() {
 
   # ── Post-start verification ──────────────────────────────────────────────────
 
-  # 0. Claude auth: copy host credentials into container.
-  #    Copying (vs bind-mount) avoids file locking conflicts and permission issues.
-  echo "▶ Copying Claude credentials into container..."
-  docker cp "${claude_dir}/." "${container}:/home/dev/.claude/"
-  docker exec -u root "$container" chown -R dev:dev /home/dev/.claude
-  echo "✓ Claude credentials copied"
+  # 0. Claude auth: named volume persists credentials across restarts.
+  #    On first start, seed settings.json from host. User runs `claude login` once.
+  docker exec -u root "$container" chown -R dev:dev /home/dev/.claude 2>/dev/null || true
+  if ! docker exec "$container" bash -c "test -f /home/dev/.claude/.credentials.json" 2>/dev/null; then
+    # First start — seed settings from host
+    docker cp "${claude_dir}/settings.json" "${container}:/home/dev/.claude/settings.json" 2>/dev/null || true
+    docker exec -u root "$container" chown -R dev:dev /home/dev/.claude 2>/dev/null || true
+    echo "⚠  First start — run 'claude login' inside the container (one-time setup)"
+  else
+    echo "✓ Claude credentials found (persisted in volume)"
+  fi
 
   # Write minimal .claude.json to skip onboarding wizard
   docker exec "$container" bash -c "python3 -c \"
@@ -306,7 +313,11 @@ echo 'cat /home/dev/.bash_motd 2>/dev/null || true' >> /home/dev/.bashrc" 2>/dev
     echo "     GITHUB_TOKEN not set — agents cannot git push directly"
     echo "     Set it with: export GITHUB_TOKEN=<token> before running lane start"
   fi
-  echo "     Claude auth: ✓ copied from host ~/.claude"
+  if docker exec "$container" bash -c "test -f /home/dev/.claude/.credentials.json" 2>/dev/null; then
+    echo "     Claude auth: ✓ credentials found (persisted in volume)"
+  else
+    echo "     Claude auth: ⚠  run 'claude login' inside container (one-time)"
+  fi
 }
 
 cmd_attach() {

@@ -7,6 +7,7 @@
 #
 # Usage:
 #   lane start <name> [branch]   # create worktree + start container
+#   lane start <name> --clone    # full git clone (supports Agent worktree isolation)
 #   lane open <name> [branch]    # start + attach in one step (most common)
 #   lane restart <name>           # stop, remove, and restart container (worktree kept)
 #   lane attach <name>            # attach a shell (then run: claude)
@@ -124,8 +125,19 @@ require_image() {
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 cmd_start() {
-  local name="${1:-}" branch="${2:-}"
-  [[ -z "$name" ]] && die "Usage: lane start <name> [branch]"
+  local name="${1:-}" branch="${2:-}" use_clone=false
+  # Check for --clone flag in any position
+  local args=()
+  for arg in "$@"; do
+    if [[ "$arg" == "--clone" ]]; then
+      use_clone=true
+    else
+      args+=("$arg")
+    fi
+  done
+  name="${args[0]:-}"
+  branch="${args[1]:-}"
+  [[ -z "$name" ]] && die "Usage: lane start <name> [branch] [--clone]"
 
   resolve_github_token || true  # warn but don't abort
   resolve_claude_token || true  # warn but don't abort
@@ -140,37 +152,50 @@ cmd_start() {
   [[ -f "$env_file" ]] || die ".env.local not found at $env_file"
   [[ -d "$claude_dir" ]] || die "~/.claude not found — log in to Claude Code first: claude auth login"
 
-  # Create worktree if needed
+  # Create workspace (clone or worktree)
   mkdir -p "$WORKTREES_DIR"
   if [[ -d "$worktree" ]]; then
-    echo "✓ Worktree already exists: $worktree"
-
-    # Verify it's a proper worktree (file) not an accidental clone (directory)
     if [[ -d "${worktree}/.git" ]]; then
-      die "Lane '$name' looks like a git clone, not a worktree (.git is a directory).
+      if $use_clone; then
+        echo "✓ Clone already exists: $worktree"
+      else
+        die "Lane '$name' looks like a git clone, not a worktree (.git is a directory).
    This will cause merge conflicts. Fix it:
      lane rm $name
-     lane start $name"
-    fi
-    if ! grep -q '^gitdir:' "${worktree}/.git" 2>/dev/null; then
-      die "Lane '$name' has a malformed .git pointer. Fix it:
+     lane start $name
+   Or use --clone if you want a full clone."
+      fi
+    else
+      echo "✓ Worktree already exists: $worktree"
+      if ! grep -q '^gitdir:' "${worktree}/.git" 2>/dev/null; then
+        die "Lane '$name' has a malformed .git pointer. Fix it:
    lane rm $name && lane start $name"
+      fi
     fi
   else
-    if [[ -z "$branch" ]]; then
-      branch="lane/${name}-$(date +%Y%m%d)"
-    fi
-    # Fetch latest main so the new branch starts from the freshest snapshot
     echo "▶ Fetching latest main from origin..."
     cd "$REPO_ROOT"
     git fetch origin main --quiet && git merge --ff-only origin/main --quiet 2>/dev/null || true
 
-    echo "▶ Creating worktree: $worktree (branch: $branch)"
-    git worktree add "$worktree" -b "$branch" 2>/dev/null \
-      || git worktree add "$worktree" "$branch"
-    # Copy .env.local into the worktree (not tracked by git)
-    cp "$env_file" "${worktree}/.env.local"
-    echo "✓ Worktree created"
+    if $use_clone; then
+      local remote_url
+      remote_url="$(git remote get-url origin)"
+      echo "▶ Cloning repo: $worktree"
+      git clone "$remote_url" "$worktree" --quiet
+      # Copy .env.local into the clone
+      cp "$env_file" "${worktree}/.env.local"
+      echo "✓ Clone created (full repo — supports worktrees and Agent isolation)"
+    else
+      if [[ -z "$branch" ]]; then
+        branch="lane/${name}-$(date +%Y%m%d)"
+      fi
+      echo "▶ Creating worktree: $worktree (branch: $branch)"
+      git worktree add "$worktree" -b "$branch" 2>/dev/null \
+        || git worktree add "$worktree" "$branch"
+      # Copy .env.local into the worktree (not tracked by git)
+      cp "$env_file" "${worktree}/.env.local"
+      echo "✓ Worktree created"
+    fi
   fi
 
   # Stop existing container if running
@@ -188,21 +213,28 @@ cmd_start() {
 
   require_image
 
-  # The worktree's .git file is a pointer to an absolute host path like:
-  #   gitdir: /Users/you/repo/.git/worktrees/lane-1
-  # That path doesn't exist inside the container unless we mount the main .git dir
-  # at the same absolute path. We extract the gitdir path to mount it correctly.
-  local git_dir_host git_dir_container_path lane_branch
-  git_dir_host="${REPO_ROOT}/.git"
-  git_dir_container_path="$(sed 's/gitdir: //' "${worktree}/.git" | sed 's|/worktrees/.*||')"
+  local lane_branch
   lane_branch="$(cd "$worktree" && git branch --show-current 2>/dev/null || echo 'unknown')"
+
+  # Build volume mounts — clones have .git inside, worktrees need the host .git mounted
+  local git_mount_args=()
+  if [[ -d "${worktree}/.git" ]]; then
+    # Clone: .git is inside the workspace, no extra mount needed
+    :
+  else
+    # Worktree: .git file points to host path, mount the main .git dir
+    local git_dir_host git_dir_container_path
+    git_dir_host="${REPO_ROOT}/.git"
+    git_dir_container_path="$(sed 's/gitdir: //' "${worktree}/.git" | sed 's|/worktrees/.*||')"
+    git_mount_args=(-v "${git_dir_host}:${git_dir_container_path}")
+  fi
 
   echo "▶ Starting container $container (app port: $port, branch: $lane_branch)"
   docker run -dit \
     --name "$container" \
     -p "${port}:3000" \
     -v "${worktree}:/workspace" \
-    -v "${git_dir_host}:${git_dir_container_path}" \
+    ${git_mount_args[@]+"${git_mount_args[@]}"} \
     -v "${env_file}:/workspace/.env.local:ro" \
     -e "TERM=xterm-256color" \
     -e "LANE_NAME=${name}" \
@@ -348,9 +380,16 @@ cmd_rm() {
   docker rm "$container" 2>/dev/null && echo "✓ Container removed" || true
 
   if [[ -d "$worktree" ]]; then
-    cd "$REPO_ROOT"
-    git worktree remove --force "$worktree" 2>/dev/null && echo "✓ Worktree removed" \
-      || echo "⚠  Could not remove worktree (uncommitted changes?): $worktree"
+    if [[ -d "${worktree}/.git" ]]; then
+      # Clone — just delete the directory
+      rm -rf "$worktree" && echo "✓ Clone removed" \
+        || echo "⚠  Could not remove clone: $worktree"
+    else
+      # Worktree — use git worktree remove
+      cd "$REPO_ROOT"
+      git worktree remove --force "$worktree" 2>/dev/null && echo "✓ Worktree removed" \
+        || echo "⚠  Could not remove worktree (uncommitted changes?): $worktree"
+    fi
   fi
 }
 
@@ -450,7 +489,7 @@ shift || true
 case "$CMD" in
   start)   cmd_start "$@" ;;
   open)    [[ -z "${1:-}" ]] && die "Usage: lane open <name> [branch]"; cmd_start "$@"; cmd_attach "${1}" ;;
-  restart) [[ -z "${1:-}" ]] && die "Usage: lane restart <name>"; cmd_stop "$1"; cmd_start "$1" ;;
+  restart) [[ -z "${1:-}" ]] && die "Usage: lane restart <name>"; cmd_stop "$1"; cmd_start "$@" ;;
   attach)  cmd_attach "$@" ;;
   stop)    cmd_stop "$@" ;;
   rm)      cmd_rm "$@" ;;

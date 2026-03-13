@@ -183,12 +183,19 @@ build_context() {
 
       while IFS= read -r importer; do
         [[ -z "$importer" ]] && continue
-        # Deduplicate and check budget
+        # Deduplicate against already-added RAG files and changed PR files
         local rel_path="${importer#$REPO_ROOT/}"
         local already_added=false
         for existing in "${rag_files[@]:-}"; do
           [[ "$existing" == "$rel_path" ]] && { already_added=true; break; }
         done
+        $already_added && continue
+        while IFS= read -r changed_entry; do
+          [[ -z "$changed_entry" ]] && continue
+          local changed_path
+          changed_path=$(printf '%s' "$changed_entry" | jq -r '.path')
+          [[ "$changed_path" == "$rel_path" ]] && { already_added=true; break; }
+        done <<< "$files_json"
         $already_added && continue
 
         local file_size

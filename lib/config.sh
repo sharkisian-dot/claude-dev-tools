@@ -140,6 +140,7 @@ DEV_PORT=$(config_get "project.dev_port" "3000")
 LANE_IMAGE=$(config_get "lane.image" "devtools-dev")
 LANE_WORKTREES_DIR=$(config_get "lane.worktrees_dir" "../$(basename "$REPO_ROOT")-lanes")
 LANE_DOCKERFILE=$(config_get "lane.dockerfile" "Dockerfile.dev")
+LANE_POST_START=$(config_get "lane.post_start_command" "")
 
 REVIEW_RULES_FILE=$(config_get "review.rules_file" "CLAUDE.md")
 REVIEW_RULES_MAX_LINES=$(config_get "review.rules_max_lines" "200")
@@ -160,7 +161,7 @@ STATIC_ANALYSIS_LINT_FIX=$(config_get "static_analysis.lint_fix_command" "")
 STATIC_ANALYSIS_FORMAT=$(config_get "static_analysis.format_command" "")
 
 export PROJECT_NAME TEST_COMMAND BUILD_COMMAND DEV_COMMAND DEV_PORT
-export LANE_IMAGE LANE_WORKTREES_DIR LANE_DOCKERFILE
+export LANE_IMAGE LANE_WORKTREES_DIR LANE_DOCKERFILE LANE_POST_START
 export REVIEW_RULES_FILE REVIEW_RULES_MAX_LINES REVIEW_SUPPRESSIONS_FILE
 export RELAY_TASKS_FILE RELAY_LOCK_DIR
 export BROWSER_TESTS_MANIFEST BROWSER_TESTS_DIR

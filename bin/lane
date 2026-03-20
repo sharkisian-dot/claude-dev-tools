@@ -229,12 +229,29 @@ cmd_start() {
     git_mount_args=(-v "${git_dir_host}:${git_dir_container_path}")
   fi
 
+  # Build extra mount args from config (lane.extra_mounts list)
+  local extra_mount_args=()
+  while IFS= read -r mount_spec; do
+    [[ -z "$mount_spec" ]] && continue
+    # Expand ~ and $HOME in source path
+    local expanded
+    expanded="$(echo "$mount_spec" | sed "s|~|${HOME}|g; s|\\\$HOME|${HOME}|g")"
+    # Only add mount if source path exists
+    local src="${expanded%%:*}"
+    if [[ -d "$src" ]]; then
+      extra_mount_args+=(-v "$expanded")
+    else
+      echo "⚠  Skipping mount (source not found): $src"
+    fi
+  done < <(config_get_list "lane.extra_mounts")
+
   echo "▶ Starting container $container (app port: $port, branch: $lane_branch)"
   docker run -dit \
     --name "$container" \
     -p "${port}:3000" \
     -v "${worktree}:/workspace" \
     ${git_mount_args[@]+"${git_mount_args[@]}"} \
+    ${extra_mount_args[@]+"${extra_mount_args[@]}"} \
     -v "${env_file}:/workspace/.env.local:ro" \
     -e "TERM=xterm-256color" \
     -e "LANE_NAME=${name}" \
@@ -248,6 +265,13 @@ cmd_start() {
     -e "GIT_COMMITTER_EMAIL=$(git config user.email 2>/dev/null || echo 'dev@local')" \
     "$DEV_IMAGE" \
     bash -c "cd /workspace && npm install --silent 2>/dev/null; exec bash"
+
+  # ── Run post-start command if configured ─────────────────────────────────────
+  if [[ -n "${LANE_POST_START:-}" ]]; then
+    echo "▶ Running post-start: ${LANE_POST_START}"
+    docker exec "$container" bash -c "cd /workspace && ${LANE_POST_START}" || \
+      echo "⚠  post_start_command failed (non-fatal)"
+  fi
 
   # ── Post-start verification ──────────────────────────────────────────────────
 

@@ -347,7 +347,7 @@ run_review() {
   local model="$3"
   local reviewer_name="$4"
   local context_file="$5"
-  local max_turns="${6:-1}"
+  local max_turns="${6:-2}"
 
   info "PR #${pr}: Running ${reviewer_name} review..."
 

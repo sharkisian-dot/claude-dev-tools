@@ -18,6 +18,7 @@
 #   relay-race --dry-run        # show execution plan
 #   relay-race --max 10         # cap total tasks
 #   relay-race --tasks OTHER.md # use a different task file
+#   relay-race --skip-judge     # skip cross-task Judge gate (runs before review)
 #   relay-race --skip-review    # skip end-of-run Opus review gate
 #   relay-race --skip-critique  # skip end-of-run visual critique gate
 #   relay-race --skip-browser   # skip end-of-run browser-use gate
@@ -51,6 +52,7 @@ SKIP_TEST_REVIEW_GATE=false
 SKIP_SIMPLIFY_GATE=false
 SKIP_HYGIENE_GATE=false
 SKIP_BROWSER_GATE=false
+SKIP_JUDGE_GATE=false
 SKIP_STATIC_ANALYSIS=false
 SKIP_SECURITY_REVIEWER=false
 PR_MODE=true
@@ -75,6 +77,7 @@ while [[ $# -gt 0 ]]; do
     --skip-simplify)     SKIP_SIMPLIFY_GATE=true;    shift ;;
     --skip-hygiene)      SKIP_HYGIENE_GATE=true;     shift ;;
     --skip-browser)      SKIP_BROWSER_GATE=true;     shift ;;
+    --skip-judge)        SKIP_JUDGE_GATE=true;       shift ;;
     --skip-static-analysis) SKIP_STATIC_ANALYSIS=true; shift ;;
     --skip-security)     SKIP_SECURITY_REVIEWER=true;  shift ;;
     --pr)                PR_MODE=true;                shift ;;
@@ -427,6 +430,10 @@ show_dry_run_plan() {
     echo ""
     echo "  [TEST REVIEW] (Sonnet) ← runs async after each commit, adds missing tests (non-blocking)"
   fi
+  if [[ "$SKIP_JUDGE_GATE" != true ]]; then
+    echo ""
+    echo "  [JUDGE GATE] (Sonnet) ← cross-task consistency check before review gate"
+  fi
   if [[ "$SKIP_REVIEW_GATE" != true ]]; then
     echo ""
     echo "  [REVIEW GATE] (Opus) ← runs after all tasks, fixes violations in-place"
@@ -703,6 +710,49 @@ run_review_gate() {
   else
     echo "⚠️  Review gate did not write done-file — check $LOCK_DIR/log-REVIEW.txt"
     echo "   Proceeding without review confirmation."
+  fi
+}
+
+# ── Judge gate (runs before review gate — cross-task consistency check) ────────
+#
+# Looks at the whole wave diff together and catches cross-task inconsistencies
+# (interface drift, incomplete migrations, conflicting assumptions) that per-task
+# agents miss. Sonnet model — fast and cheap, runs before the expensive Opus gate.
+run_judge_gate() {
+  local done_file="$LOCK_DIR/done-JUDGE"
+  local log="$LOCK_DIR/log-JUDGE.txt"
+
+  local diff_size
+  diff_size=$(git diff "${RELAY_BASE_SHA}..HEAD" 2>/dev/null | wc -c) || diff_size=0
+  if (( diff_size == 0 )); then
+    echo "  ⏭️  No changes since relay start — skipping judge gate"
+    return 0
+  fi
+
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "⚖️  Running Judge gate (cross-task consistency)..."
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo ""
+
+  local prompt
+  prompt=$(load_agent "relay-judge")
+  prompt="${prompt//\{\{RELAY_BASE_SHA\}\}/${RELAY_BASE_SHA}}"
+
+  rm -f "$done_file"
+  duration_log_start
+  env -u CLAUDECODE -u ANTHROPIC_API_KEY claude --dangerously-skip-permissions \
+    --model claude-sonnet-4-6 \
+    -p "$prompt" 2>&1 | tee "$log"
+  duration_log_end "gate:judge" "claude-sonnet-4-6"
+
+  echo ""
+  if [[ -f "$done_file" ]]; then
+    echo "✅ Judge gate:"
+    cat "$done_file"
+  else
+    echo "⚠️  Judge gate did not write done-file — check $LOCK_DIR/log-JUDGE.txt"
+    echo "   Proceeding without judge confirmation."
   fi
 }
 
@@ -1233,6 +1283,20 @@ if [[ "$SKIP_STATIC_ANALYSIS" != true ]]; then
 else
   echo ""
   echo "⏭️  Static analysis gate skipped (--skip-static-analysis)"
+fi
+
+# ── Judge gate (cross-task consistency, runs before review gate) ──────────────
+if [[ "$SKIP_JUDGE_GATE" != true ]]; then
+  if is_gate_done "judge"; then
+    echo ""
+    echo "⏭️  Judge gate already completed (resume)"
+  else
+    run_judge_gate
+    save_gate_completed "judge"
+  fi
+else
+  echo ""
+  echo "⏭️  Judge gate skipped (--skip-judge)"
 fi
 
 # ── Review gate ───────────────────────────────────────────────────────────────

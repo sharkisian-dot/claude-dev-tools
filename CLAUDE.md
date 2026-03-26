@@ -44,6 +44,7 @@ Projects override agents by placing files in `.devtools/agents/` with the same n
 | Test reviewer gate | Sonnet | relay-race |
 | Code simplifier gate | Haiku | relay-race |
 | Hygiene gate | Haiku | relay-race |
+| Judge gate | Sonnet | relay-race |
 | Review gate | Opus | relay-race |
 | Visual critique gate | Sonnet | relay-race |
 | Planning agent | Opus | opus-plan |
@@ -70,6 +71,7 @@ devtools relay-race                          # sequential, creates PR
 devtools relay-race --parallel 3             # up to 3 concurrent agents
 devtools relay-race --no-pr                  # commit to current branch
 devtools relay-race --dry-run                # show execution plan
+devtools relay-race --skip-judge             # skip cross-task Judge gate
 devtools relay-race --skip-review            # skip Opus review gate
 devtools relay-race --skip-static-analysis   # skip deterministic lint/typecheck gate
 devtools relay-race --skip-browser           # skip browser-use gate
@@ -96,7 +98,8 @@ Run automatically after all tasks complete:
 2. **Code simplifier** (Haiku) — per-task, flags dead code and duplication
 3. **Test reviewer** (Sonnet) — per-task, writes missing tests
 4. **Hygiene** (Haiku) — checks rules file size, doc clutter, broken refs
-5. **Opus review** (Opus) — reviews full diff, fixes violations in-place
+5. **Judge** (Sonnet) — cross-task consistency: interface drift, incomplete migrations, test gaps
+6. **Opus review** (Opus) — reviews full diff, fixes violations in-place
 6. **Visual critique** (Sonnet vision) — screenshots UI pages, flags regressions
 
 ## Duration Tracking

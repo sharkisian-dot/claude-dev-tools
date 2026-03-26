@@ -481,12 +481,12 @@ _worktree_setup() {
   local wt_dir="${LOCK_DIR}/wt-${task_id}"
   local wt_branch="relay-wt-${task_id}"
 
-  git worktree add "$wt_dir" -b "$wt_branch" HEAD 2>&1 | tee -a "$log"
+  git worktree add "$wt_dir" -b "$wt_branch" HEAD 2>&1 | tee -a "$log" >&2
 
   # Run project-level worktree initialization if the script exists
   local init_script="${REPO_ROOT}/scripts/worktree-init.sh"
   if [[ -x "$init_script" ]]; then
-    bash "$init_script" "$wt_dir" 2>&1 | tee -a "$log" || true
+    bash "$init_script" "$wt_dir" 2>&1 | tee -a "$log" >&2 || true
   else
     # Fallback: copy env file if no init script
     if [[ -f "${REPO_ROOT}/.env.local" ]]; then
@@ -494,7 +494,7 @@ _worktree_setup() {
     fi
   fi
 
-  echo "  🌿 [${task_id}] Worktree: ${wt_dir}" | tee -a "$log"
+  echo "  🌿 [${task_id}] Worktree: ${wt_dir}" | tee -a "$log" >&2
   echo "$wt_dir"
 }
 

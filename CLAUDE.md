@@ -74,6 +74,7 @@ devtools relay-race --dry-run                # show execution plan
 devtools relay-race --skip-judge             # skip cross-task Judge gate
 devtools relay-race --skip-review            # skip Opus review gate
 devtools relay-race --skip-static-analysis   # skip deterministic lint/typecheck gate
+# To enable native worktrees: set relay.use_native_worktrees: true in .devtools.yaml
 devtools relay-race --skip-browser           # skip browser-use gate
 devtools relay-race --skip-hygiene           # skip hygiene gate
 devtools relay-race --skip-simplify          # skip code simplifier gate

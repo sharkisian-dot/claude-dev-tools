@@ -20,6 +20,11 @@
 #   relay-race --tasks OTHER.md # use a different task file
 #   relay-race --skip-judge     # skip cross-task Judge gate (runs before review)
 #   relay-race --skip-review    # skip end-of-run Opus review gate
+#
+# ── Native worktree mode ───────────────────────────────────────────────────────
+#   Set relay.use_native_worktrees: true in .devtools.yaml to run each parallel
+#   task in an isolated git worktree. Prevents file-level conflicts without Docker.
+#   Each worktree is created at .relay-locks/wt-TASKID/, merged back, then removed.
 #   relay-race --skip-critique  # skip end-of-run visual critique gate
 #   relay-race --skip-browser   # skip end-of-run browser-use gate
 #   relay-race --skip-hygiene   # skip end-of-run hygiene gate
@@ -61,6 +66,7 @@ STRICT_CONFLICTS=false
 RESUME_MODE=false
 TASKS_FILE="${RELAY_TASKS_FILE}"
 LOCK_DIR="${RELAY_LOCK_DIR}"
+USE_NATIVE_WORKTREES="${RELAY_USE_NATIVE_WORKTREES:-false}"
 RELAY_BRANCH=""
 
 # ── Arg parsing ───────────────────────────────────────────────────────────────
@@ -456,6 +462,84 @@ if [[ "$DRY_RUN" == true ]]; then
   exit 0
 fi
 
+# ── Native worktree helpers ─────────────────────────────────────────────────────
+#
+# When relay.use_native_worktrees=true in .devtools.yaml, each task runs in an
+# isolated git worktree. This prevents parallel agents from conflicting on shared
+# files. After the agent commits in its worktree, the changes are cherry-picked
+# into the relay branch and the worktree is removed.
+#
+# Worktrees are created at: ${LOCK_DIR}/wt-${task_id}/
+# Worktree branches:        relay-wt-${task_id}
+#
+# Gap (acceptable for now): all worktrees use the same DEV_PORT — agents check
+# if the pre-started dev server is reachable, not start their own.
+
+_worktree_setup() {
+  local task_id="$1"
+  local log="$2"
+  local wt_dir="${LOCK_DIR}/wt-${task_id}"
+  local wt_branch="relay-wt-${task_id}"
+
+  git worktree add "$wt_dir" -b "$wt_branch" HEAD 2>&1 | tee -a "$log"
+
+  # Run project-level worktree initialization if the script exists
+  local init_script="${REPO_ROOT}/scripts/worktree-init.sh"
+  if [[ -x "$init_script" ]]; then
+    bash "$init_script" "$wt_dir" 2>&1 | tee -a "$log" || true
+  else
+    # Fallback: copy env file if no init script
+    if [[ -f "${REPO_ROOT}/.env.local" ]]; then
+      cp "${REPO_ROOT}/.env.local" "${wt_dir}/.env.local"
+    fi
+  fi
+
+  echo "  🌿 [${task_id}] Worktree: ${wt_dir}" | tee -a "$log"
+  echo "$wt_dir"
+}
+
+_worktree_merge_back() {
+  local task_id="$1"
+  local wt_dir="$2"
+  local log="$3"
+  local wt_branch="relay-wt-${task_id}"
+
+  # Check if the agent made any commits in the worktree
+  local wt_commits
+  wt_commits=$(git -C "$wt_dir" log HEAD...$(git rev-parse HEAD) --oneline 2>/dev/null | wc -l | tr -d ' ')
+
+  if (( wt_commits == 0 )); then
+    echo "  ⏭️  [${task_id}] No commits in worktree — skipping merge" | tee -a "$log"
+  else
+    echo "  🔀 [${task_id}] Merging ${wt_commits} commit(s) from worktree..." | tee -a "$log"
+    # Squash all worktree commits into a merge commit on the relay branch
+    git merge "$wt_branch" --no-ff \
+      -m "feat: Task ${task_id} (worktree merge)" 2>&1 | tee -a "$log" || {
+      echo "  ⚠️  [${task_id}] Merge conflict — aborting merge, keeping worktree for inspection" | tee -a "$log"
+      git merge --abort 2>/dev/null || true
+      return 1
+    }
+    echo "  ✅ [${task_id}] Merge complete" | tee -a "$log"
+  fi
+
+  # Copy done-file from worktree LOCK_DIR to main LOCK_DIR (agent wrote it there)
+  local wt_done="${wt_dir}/${LOCK_DIR}/done-${task_id}"
+  if [[ -f "$wt_done" ]]; then
+    cp "$wt_done" "${LOCK_DIR}/done-${task_id}"
+  fi
+}
+
+_worktree_cleanup() {
+  local task_id="$1"
+  local wt_dir="$2"
+  local log="$3"
+  local wt_branch="relay-wt-${task_id}"
+
+  git worktree remove --force "$wt_dir" 2>&1 | tee -a "$log" || true
+  git branch -D "$wt_branch" 2>/dev/null || true
+  echo "  🧹 [${task_id}] Worktree cleaned up" | tee -a "$log"
+}
+
 # ── Agent runner (called as background subshell) ───────────────────────────────
 run_task() {
   local task_id="$1"
@@ -472,40 +556,55 @@ run_task() {
   echo "  🚀 [${task_id}] Starting" | tee "$log"
   duration_log_start
 
+  # ── Worktree isolation (when relay.use_native_worktrees=true) ──────────────
+  local run_dir="$REPO_ROOT"
+  local wt_dir=""
+  if [[ "$USE_NATIVE_WORKTREES" == "true" ]]; then
+    wt_dir=$(_worktree_setup "$task_id" "$log")
+    run_dir="$wt_dir"
+  fi
+
+  # ── Execute agent (in worktree dir if enabled) ─────────────────────────────
   if [[ "$USE_GEMINI" == true && "$model" != "claude-opus-4-6" ]]; then
     local stderr_tmp; stderr_tmp=$(mktemp)
-    gemini --yolo --model "$GEMINI_MODEL" --prompt "$prompt" \
+    (cd "$run_dir" && gemini --yolo --model "$GEMINI_MODEL" --prompt "$prompt") \
       2>"$stderr_tmp" | tee -a "$log" || {
       cat "$stderr_tmp" >&2
       echo "  ⚠️  [${task_id}] Gemini failed — falling back to Claude" | tee -a "$log"
-      env -u CLAUDECODE -u ANTHROPIC_API_KEY claude --dangerously-skip-permissions --model "$model" \
-        -p "$prompt" 2>&1 | tee -a "$log" || {
+      (cd "$run_dir" && env -u CLAUDECODE -u ANTHROPIC_API_KEY claude --dangerously-skip-permissions --model "$model" \
+        -p "$prompt") 2>&1 | tee -a "$log" || {
         # Retry once on failure if no done-file (transient error, not partial completion)
         if [[ ! -f "$done_file" ]]; then
           echo "  ⚠️  [${task_id}] Fallback also failed — retrying in 30s..." | tee -a "$log"
           sleep 30
-          env -u CLAUDECODE -u ANTHROPIC_API_KEY claude --dangerously-skip-permissions --model "$model" \
-            -p "$prompt" 2>&1 | tee -a "$log" || \
+          (cd "$run_dir" && env -u CLAUDECODE -u ANTHROPIC_API_KEY claude --dangerously-skip-permissions --model "$model" \
+            -p "$prompt") 2>&1 | tee -a "$log" || \
             echo "  ✗ [${task_id}] Retry also failed" | tee -a "$log"
         fi
       }
     }
     rm -f "$stderr_tmp"
   else
-    env -u CLAUDECODE -u ANTHROPIC_API_KEY claude --dangerously-skip-permissions --model "$model" \
-      -p "$prompt" 2>&1 | tee -a "$log" || {
+    (cd "$run_dir" && env -u CLAUDECODE -u ANTHROPIC_API_KEY claude --dangerously-skip-permissions --model "$model" \
+      -p "$prompt") 2>&1 | tee -a "$log" || {
       # Retry once on failure if no done-file (transient error, not partial completion)
       if [[ ! -f "$done_file" ]]; then
         echo "  ⚠️  [${task_id}] Agent failed — retrying in 30s..." | tee -a "$log"
         sleep 30
-        env -u CLAUDECODE -u ANTHROPIC_API_KEY claude --dangerously-skip-permissions --model "$model" \
-          -p "$prompt" 2>&1 | tee -a "$log" || \
+        (cd "$run_dir" && env -u CLAUDECODE -u ANTHROPIC_API_KEY claude --dangerously-skip-permissions --model "$model" \
+          -p "$prompt") 2>&1 | tee -a "$log" || \
           echo "  ✗ [${task_id}] Retry also failed" | tee -a "$log"
       fi
     }
   fi
 
   duration_log_end "task:${task_id}" "$model"
+
+  # ── Merge worktree back (if worktree mode) ─────────────────────────────────
+  if [[ -n "$wt_dir" ]]; then
+    _worktree_merge_back "$task_id" "$wt_dir" "$log" || true
+    _worktree_cleanup "$task_id" "$wt_dir" "$log"
+  fi
 
   # If agent forgot the done-file, write a fallback so the main loop can proceed
   if [[ ! -f "$done_file" ]]; then

@@ -148,6 +148,7 @@ REVIEW_SUPPRESSIONS_FILE=$(config_get "review.suppressions_file" ".devtools/revi
 
 RELAY_TASKS_FILE=$(config_get "relay.tasks_file" "TASKS.md")
 RELAY_LOCK_DIR=$(config_get "relay.lock_dir" ".relay-locks")
+RELAY_USE_NATIVE_WORKTREES=$(config_get "relay.use_native_worktrees" "false")
 
 BROWSER_TESTS_MANIFEST=$(config_get "browser_tests.manifest" "browser-tests/test-manifest.json")
 BROWSER_TESTS_DIR=$(config_get "browser_tests.dir" "browser-tests")
@@ -163,7 +164,7 @@ STATIC_ANALYSIS_FORMAT=$(config_get "static_analysis.format_command" "")
 export PROJECT_NAME TEST_COMMAND BUILD_COMMAND DEV_COMMAND DEV_PORT
 export LANE_IMAGE LANE_WORKTREES_DIR LANE_DOCKERFILE LANE_POST_START
 export REVIEW_RULES_FILE REVIEW_RULES_MAX_LINES REVIEW_SUPPRESSIONS_FILE
-export RELAY_TASKS_FILE RELAY_LOCK_DIR
+export RELAY_TASKS_FILE RELAY_LOCK_DIR RELAY_USE_NATIVE_WORKTREES
 export BROWSER_TESTS_MANIFEST BROWSER_TESTS_DIR
 export HYGIENE_MAX_RULES_LINES
 export STATIC_ANALYSIS_TYPECHECK STATIC_ANALYSIS_LINT STATIC_ANALYSIS_LINT_FIX STATIC_ANALYSIS_FORMAT

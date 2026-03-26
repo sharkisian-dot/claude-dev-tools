@@ -26,6 +26,10 @@ review:
 relay:
   tasks_file: "TASKS.md"
   lock_dir: ".relay-locks"
+  # use_native_worktrees: true  # Run each parallel task in its own git worktree.
+  #   Prevents file-level conflicts without Docker. Each task gets an isolated
+  #   checkout; changes are merged back to the relay branch on completion.
+  #   Requires: git 2.5+. Optional: scripts/worktree-init.sh for per-worktree setup.
 
 # Browser-use test configuration
 browser_tests:

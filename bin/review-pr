@@ -347,19 +347,25 @@ run_review() {
   local model="$3"
   local reviewer_name="$4"
   local context_file="$5"
+  local max_turns="${6:-1}"
 
   info "PR #${pr}: Running ${reviewer_name} review..."
 
-  local review_output review_stderr
+  local review_output review_stderr prompt_file
   review_stderr=$(mktemp)
-  TEMP_FILES+=("$review_stderr")
+  prompt_file=$(mktemp)
+  TEMP_FILES+=("$review_stderr" "$prompt_file")
 
-  review_output=$(env -u CLAUDECODE claude -p "${prompt}
+  # Write combined prompt+context to a temp file to avoid ARG_MAX limits,
+  # then feed it via stdin (claude -p -) rather than as a shell argument.
+  printf '%s\n\n' "$prompt" > "$prompt_file"
+  cat "$context_file" >> "$prompt_file"
 
-$(cat "$context_file")" \
+  review_output=$(env -u CLAUDECODE claude -p - \
     --model "$model" \
     --output-format text \
-    --max-turns 1 \
+    --max-turns "$max_turns" \
+    < "$prompt_file" \
     2>"$review_stderr") || {
       err "${reviewer_name} review failed for PR #${pr}:"
       cat "$review_stderr" >&2
@@ -468,7 +474,7 @@ ${OUTPUT_FORMAT}"
     run_review "$pr" "$REVIEW_PROMPT" "sonnet" "Sonnet" "$context_file" &
     pids+=($!)
 
-    run_review "$pr" "$OPUS_PROMPT" "opus" "Opus Architect" "$context_file" &
+    run_review "$pr" "$OPUS_PROMPT" "opus" "Opus Architect" "$context_file" 2 &
     pids+=($!)
 
     if [[ "$SKIP_TEST_COVERAGE" != "true" ]]; then

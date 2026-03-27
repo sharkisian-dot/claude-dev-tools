@@ -347,7 +347,7 @@ run_review() {
   local model="$3"
   local reviewer_name="$4"
   local context_file="$5"
-  local max_turns="${6:-2}"
+  local max_turns="${6:-10}"
 
   info "PR #${pr}: Running ${reviewer_name} review..."
 
@@ -474,7 +474,7 @@ ${OUTPUT_FORMAT}"
     run_review "$pr" "$REVIEW_PROMPT" "sonnet" "Sonnet" "$context_file" &
     pids+=($!)
 
-    run_review "$pr" "$OPUS_PROMPT" "opus" "Opus Architect" "$context_file" 2 &
+    run_review "$pr" "$OPUS_PROMPT" "opus" "Opus Architect" "$context_file" &
     pids+=($!)
 
     if [[ "$SKIP_TEST_COVERAGE" != "true" ]]; then

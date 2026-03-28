@@ -577,7 +577,7 @@ ${OUTPUT_FORMAT}"
     post_commit_status "pending" "Type check pending…" "Type Check"
     post_commit_status "pending" "Test suite pending…" "Test Suite"
 
-    # Run all reviewers in parallel
+    # ── Round 1: Claude reviewers (always run) ───────────────────────────────
     local pids=()
     local reviewer_names=("Sonnet" "Opus Architect")
 
@@ -605,31 +605,16 @@ ${OUTPUT_FORMAT}"
       reviewer_names+=("Security")
     fi
 
-    # Gemini: auto-enable when GOOGLE_API_KEY is set, or explicitly requested
-    if [[ "$USE_GEMINI" == "true" ]] || [[ -n "${GOOGLE_API_KEY:-}" && "$SKIP_GEMINI" != "true" ]]; then
-      run_review "$pr" "$REVIEW_PROMPT" "$GEMINI_MODEL" "Gemini" "$context_file" 2 "gemini" &
-      pids+=($!)
-      reviewer_names+=("Gemini")
-    fi
-
-    # OpenAI: auto-enable when OPENAI_API_KEY is set, or explicitly requested
-    if [[ "$USE_OPENAI" == "true" ]] || [[ -n "${OPENAI_API_KEY:-}" && "$SKIP_OPENAI" != "true" ]]; then
-      run_review "$pr" "$REVIEW_PROMPT" "$OPENAI_MODEL" "OpenAI" "$context_file" 2 "openai" &
-      pids+=($!)
-      reviewer_names+=("OpenAI")
-    fi
-
-    # Wait for all reviewers
+    # Wait for round 1
     for pid in "${pids[@]}"; do
       wait "$pid" 2>/dev/null || true
     done
 
-    # Run type check and test suite after reviewers complete
+    # Run type check and test suite after round 1
     run_type_check
     run_test_suite
 
-    # Aggregate verdicts from temp files written by run_review subprocesses
-    # Severity-based: only [critical] issues trigger failure; [warning] issues become GitHub issues
+    # Aggregate round 1 results
     local critical_count=0
     local total_count=0
     local all_warnings=()
@@ -641,7 +626,6 @@ ${OUTPUT_FORMAT}"
         reviewer_criticals=$(jq '[.issues[] | select(.severity == "critical")] | length' < "$output_file" 2>/dev/null || echo 0)
         critical_count=$(( critical_count + reviewer_criticals ))
         total_count=$(( total_count + 1 ))
-        # Collect warning messages to file as GitHub issues
         while IFS= read -r warning_msg; do
           [[ -n "$warning_msg" ]] && all_warnings+=("$warning_msg")
         done < <(jq -r '.issues[] | select(.severity == "warning") | .message' < "$output_file" 2>/dev/null)
@@ -650,6 +634,53 @@ ${OUTPUT_FORMAT}"
       rm -f "$verdict_file"
     done
 
+    # ── Round 2: Gemini + OpenAI (only when round 1 is clean) ────────────────
+    # These reviewers add value specifically in the "Claude gave a clean pass
+    # but something might be lurking" scenario. Skip them if there are already
+    # critical issues — the PR needs fixes regardless, no second opinion needed.
+    local ext_reviewer_names=()
+    if [[ $critical_count -eq 0 ]]; then
+      local ext_pids=()
+
+      if [[ "$USE_GEMINI" == "true" ]] || [[ -n "${GOOGLE_API_KEY:-}" && "$SKIP_GEMINI" != "true" ]]; then
+        run_review "$pr" "$REVIEW_PROMPT" "$GEMINI_MODEL" "Gemini" "$context_file" 2 "gemini" &
+        ext_pids+=($!)
+        ext_reviewer_names+=("Gemini")
+      fi
+
+      if [[ "$USE_OPENAI" == "true" ]] || [[ -n "${OPENAI_API_KEY:-}" && "$SKIP_OPENAI" != "true" ]]; then
+        run_review "$pr" "$REVIEW_PROMPT" "$OPENAI_MODEL" "OpenAI" "$context_file" 2 "openai" &
+        ext_pids+=($!)
+        ext_reviewer_names+=("OpenAI")
+      fi
+
+      if [[ ${#ext_pids[@]} -gt 0 ]]; then
+        info "PR #${pr}: Round 1 clean — running external reviewers (${ext_reviewer_names[*]})..."
+        for pid in "${ext_pids[@]}"; do
+          wait "$pid" 2>/dev/null || true
+        done
+
+        # Fold round 2 results into the aggregate
+        for reviewer_name in "${ext_reviewer_names[@]}"; do
+          local output_file="/tmp/review-output-${reviewer_name}-$$"
+          local verdict_file="/tmp/review-verdict-${reviewer_name}-$$"
+          if [[ -f "$output_file" ]]; then
+            local reviewer_criticals
+            reviewer_criticals=$(jq '[.issues[] | select(.severity == "critical")] | length' < "$output_file" 2>/dev/null || echo 0)
+            critical_count=$(( critical_count + reviewer_criticals ))
+            while IFS= read -r warning_msg; do
+              [[ -n "$warning_msg" ]] && all_warnings+=("$warning_msg")
+            done < <(jq -r '.issues[] | select(.severity == "warning") | .message' < "$output_file" 2>/dev/null)
+            rm -f "$output_file"
+          fi
+          rm -f "$verdict_file"
+        done
+      fi
+    else
+      info "PR #${pr}: Round 1 found ${critical_count} critical issue(s) — skipping external reviewers"
+    fi
+
+    # ── Final aggregate ───────────────────────────────────────────────────────
     if [[ $critical_count -gt 0 ]]; then
       post_commit_status "failure" "${critical_count} critical issue(s) found"
       info "PR #${pr}: Aggregate verdict — FAILURE (${critical_count} critical issue(s))"

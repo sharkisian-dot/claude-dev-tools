@@ -12,6 +12,10 @@
 #   devtools review-pr --incremental 18         # only review new commits since last review
 #   devtools review-pr --max-diff-lines 1200 18 # adjust max diff line threshold
 #   devtools review-pr --force 18              # review even if diff exceeds limit
+#   devtools review-pr --use-gemini 18         # add Gemini as extra correctness reviewer
+#   devtools review-pr --use-openai 18         # add OpenAI as extra correctness reviewer
+#   devtools review-pr --gemini-model gemini-2.5-flash 18
+#   devtools review-pr --openai-model gpt-4o 18
 #
 # Reviewers (all run in parallel):
 #   1. Sonnet correctness — bugs, error handling, data integrity
@@ -19,9 +23,12 @@
 #   3. Sonnet test coverage — missing tests for changed code
 #   4. Sonnet file organization — structural problems, repo hygiene
 #   5. Sonnet security — vulnerabilities, secrets, auth, injection
+#   6. Gemini correctness — (optional, --use-gemini) requires GOOGLE_API_KEY
+#   7. OpenAI correctness — (optional, --use-openai) requires OPENAI_API_KEY
 #
 # Requires: claude CLI (authenticated), gh CLI (authenticated)
-# Cost: $0 — uses your Claude subscription, not API tokens
+# Cost: $0 for Claude — uses your Claude subscription, not API tokens
+#       Gemini/OpenAI reviewers use API keys (GOOGLE_API_KEY / OPENAI_API_KEY)
 
 set -eo pipefail
 
@@ -47,6 +54,10 @@ AUTO_APPROVE="${AUTO_APPROVE:-false}"
 SKIP_TEST_COVERAGE="${SKIP_TEST_COVERAGE:-false}"
 SKIP_FILE_ORG="${SKIP_FILE_ORG:-false}"
 SKIP_SECURITY="${SKIP_SECURITY:-false}"
+USE_GEMINI="${USE_GEMINI:-false}"
+USE_OPENAI="${USE_OPENAI:-false}"
+GEMINI_MODEL="${GEMINI_MODEL:-gemini-2.5-flash}"
+OPENAI_MODEL="${OPENAI_MODEL:-gpt-4o}"
 PR_NUMBER="${PR_NUMBER:-}"
 MAX_DIFF_LINES="${MAX_DIFF_LINES:-800}"
 FORCE_REVIEW="${FORCE_REVIEW:-false}"
@@ -348,6 +359,7 @@ run_review() {
   local reviewer_name="$4"
   local context_file="$5"
   local max_turns="${6:-2}"
+  local provider="${7:-claude}"  # claude | gemini | openai
 
   info "PR #${pr}: Running ${reviewer_name} review..."
 
@@ -357,20 +369,32 @@ run_review() {
   TEMP_FILES+=("$review_stderr" "$prompt_file")
 
   # Write combined prompt+context to a temp file to avoid ARG_MAX limits,
-  # then feed it via stdin (claude -p -) rather than as a shell argument.
+  # then feed it via stdin rather than as a shell argument.
   printf '%s\n\n' "$prompt" > "$prompt_file"
   cat "$context_file" >> "$prompt_file"
 
-  review_output=$(env -u CLAUDECODE claude -p - \
-    --model "$model" \
-    --output-format text \
-    --max-turns "$max_turns" \
-    < "$prompt_file" \
-    2>"$review_stderr") || {
-      err "${reviewer_name} review failed for PR #${pr}:"
-      cat "$review_stderr" >&2
-      return 1
-    }
+  if [[ "$provider" == "gemini" || "$provider" == "openai" ]]; then
+    review_output=$(python3 "${DEVTOOLS_ROOT}/lib/call-model.py" \
+      --provider "$provider" \
+      --model "$model" \
+      < "$prompt_file" \
+      2>"$review_stderr") || {
+        err "${reviewer_name} review failed for PR #${pr}:"
+        cat "$review_stderr" >&2
+        return 1
+      }
+  else
+    review_output=$(env -u CLAUDECODE claude -p - \
+      --model "$model" \
+      --output-format text \
+      --max-turns "$max_turns" \
+      < "$prompt_file" \
+      2>"$review_stderr") || {
+        err "${reviewer_name} review failed for PR #${pr}:"
+        cat "$review_stderr" >&2
+        return 1
+      }
+  fi
 
   local review_json
   review_json=$(parse_review_json "$review_output")
@@ -483,6 +507,10 @@ main() {
       --incremental)         INCREMENTAL=true;          shift ;;
       --max-diff-lines)      MAX_DIFF_LINES="$2";        shift 2 ;;
       --force)               FORCE_REVIEW=true;           shift ;;
+      --use-gemini)          USE_GEMINI=true;           shift ;;
+      --use-openai)          USE_OPENAI=true;           shift ;;
+      --gemini-model)        GEMINI_MODEL="$2";         shift 2 ;;
+      --openai-model)        OPENAI_MODEL="$2";         shift 2 ;;
       *)                     PR_NUMBER="$1";            shift ;;
     esac
   done
@@ -571,6 +599,18 @@ ${OUTPUT_FORMAT}"
       run_review "$pr" "$SECURITY_PROMPT" "sonnet" "Security" "$context_file" &
       pids+=($!)
       reviewer_names+=("Security")
+    fi
+
+    if [[ "$USE_GEMINI" == "true" ]]; then
+      run_review "$pr" "$REVIEW_PROMPT" "$GEMINI_MODEL" "Gemini" "$context_file" 2 "gemini" &
+      pids+=($!)
+      reviewer_names+=("Gemini")
+    fi
+
+    if [[ "$USE_OPENAI" == "true" ]]; then
+      run_review "$pr" "$REVIEW_PROMPT" "$OPENAI_MODEL" "OpenAI" "$context_file" 2 "openai" &
+      pids+=($!)
+      reviewer_names+=("OpenAI")
     fi
 
     # Wait for all reviewers

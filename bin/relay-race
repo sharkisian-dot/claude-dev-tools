@@ -92,6 +92,26 @@ done
 
 mkdir -p "$LOCK_DIR"
 
+# ── Skip-flag audit logging ────────────────────────────────────────────────────
+# Log any active --skip-* flags to skip-audit.jsonl for governance tracking
+_active_skip_flags=()
+[[ "$SKIP_REVIEW_GATE" == true ]] && _active_skip_flags+=("--skip-review")
+[[ "$SKIP_CRITIQUE_GATE" == true ]] && _active_skip_flags+=("--skip-critique")
+[[ "$SKIP_TEST_REVIEW_GATE" == true ]] && _active_skip_flags+=("--skip-test-review")
+[[ "$SKIP_SIMPLIFY_GATE" == true ]] && _active_skip_flags+=("--skip-simplify")
+[[ "$SKIP_HYGIENE_GATE" == true ]] && _active_skip_flags+=("--skip-hygiene")
+[[ "$SKIP_BROWSER_GATE" == true ]] && _active_skip_flags+=("--skip-browser")
+[[ "$SKIP_STATIC_ANALYSIS" == true ]] && _active_skip_flags+=("--skip-static-analysis")
+[[ "$SKIP_SECURITY_REVIEWER" == true ]] && _active_skip_flags+=("--skip-security")
+
+if [[ ${#_active_skip_flags[@]} -gt 0 ]]; then
+  _ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  _user=$(git config user.email)
+  _branch=$(git branch --show-current 2>/dev/null || echo "unknown")
+  _flags_json=$(printf '%s\n' "${_active_skip_flags[@]}" | jq -R . | jq -c -s .)
+  printf '%s\n' "{\"ts\":\"${_ts}\",\"user\":\"${_user}\",\"flags\":${_flags_json},\"branch\":\"${_branch}\"}" >> "$LOCK_DIR/skip-audit.jsonl"
+fi
+
 # Auto-clean stale claims (avoids manual rm -rf .relay-locks/claim-* after crashes)
 find "$LOCK_DIR" -name "claim-*" -maxdepth 1 -mmin +120 -exec rm -rf {} + 2>/dev/null || true
 

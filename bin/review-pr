@@ -12,8 +12,8 @@
 #   devtools review-pr --incremental 18         # only review new commits since last review
 #   devtools review-pr --max-diff-lines 1200 18 # adjust max diff line threshold
 #   devtools review-pr --force 18              # review even if diff exceeds limit
-#   devtools review-pr --use-gemini 18         # add Gemini as extra correctness reviewer
-#   devtools review-pr --use-openai 18         # add OpenAI as extra correctness reviewer
+#   devtools review-pr --skip-gemini 18        # disable Gemini even if GOOGLE_API_KEY is set
+#   devtools review-pr --skip-openai 18        # disable OpenAI even if OPENAI_API_KEY is set
 #   devtools review-pr --gemini-model gemini-2.5-flash 18
 #   devtools review-pr --openai-model gpt-4o 18
 #
@@ -23,8 +23,8 @@
 #   3. Sonnet test coverage — missing tests for changed code
 #   4. Sonnet file organization — structural problems, repo hygiene
 #   5. Sonnet security — vulnerabilities, secrets, auth, injection
-#   6. Gemini correctness — (optional, --use-gemini) requires GOOGLE_API_KEY
-#   7. OpenAI correctness — (optional, --use-openai) requires OPENAI_API_KEY
+#   6. Gemini 3.1 Pro — auto-enabled when GOOGLE_API_KEY is set (--skip-gemini to disable)
+#   7. GPT-5.4 — auto-enabled when OPENAI_API_KEY is set (--skip-openai to disable)
 #
 # Requires: claude CLI (authenticated), gh CLI (authenticated)
 # Cost: $0 for Claude — uses your Claude subscription, not API tokens
@@ -56,8 +56,10 @@ SKIP_FILE_ORG="${SKIP_FILE_ORG:-false}"
 SKIP_SECURITY="${SKIP_SECURITY:-false}"
 USE_GEMINI="${USE_GEMINI:-false}"
 USE_OPENAI="${USE_OPENAI:-false}"
-GEMINI_MODEL="${GEMINI_MODEL:-gemini-2.5-flash}"
-OPENAI_MODEL="${OPENAI_MODEL:-gpt-4o}"
+SKIP_GEMINI="${SKIP_GEMINI:-false}"
+SKIP_OPENAI="${SKIP_OPENAI:-false}"
+GEMINI_MODEL="${GEMINI_MODEL:-gemini-3.1-pro-preview}"
+OPENAI_MODEL="${OPENAI_MODEL:-gpt-5.4-2026-03-05}"
 PR_NUMBER="${PR_NUMBER:-}"
 MAX_DIFF_LINES="${MAX_DIFF_LINES:-800}"
 FORCE_REVIEW="${FORCE_REVIEW:-false}"
@@ -509,6 +511,8 @@ main() {
       --force)               FORCE_REVIEW=true;           shift ;;
       --use-gemini)          USE_GEMINI=true;           shift ;;
       --use-openai)          USE_OPENAI=true;           shift ;;
+      --skip-gemini)         SKIP_GEMINI=true;          shift ;;
+      --skip-openai)         SKIP_OPENAI=true;          shift ;;
       --gemini-model)        GEMINI_MODEL="$2";         shift 2 ;;
       --openai-model)        OPENAI_MODEL="$2";         shift 2 ;;
       *)                     PR_NUMBER="$1";            shift ;;
@@ -601,13 +605,15 @@ ${OUTPUT_FORMAT}"
       reviewer_names+=("Security")
     fi
 
-    if [[ "$USE_GEMINI" == "true" ]]; then
+    # Gemini: auto-enable when GOOGLE_API_KEY is set, or explicitly requested
+    if [[ "$USE_GEMINI" == "true" ]] || [[ -n "${GOOGLE_API_KEY:-}" && "$SKIP_GEMINI" != "true" ]]; then
       run_review "$pr" "$REVIEW_PROMPT" "$GEMINI_MODEL" "Gemini" "$context_file" 2 "gemini" &
       pids+=($!)
       reviewer_names+=("Gemini")
     fi
 
-    if [[ "$USE_OPENAI" == "true" ]]; then
+    # OpenAI: auto-enable when OPENAI_API_KEY is set, or explicitly requested
+    if [[ "$USE_OPENAI" == "true" ]] || [[ -n "${OPENAI_API_KEY:-}" && "$SKIP_OPENAI" != "true" ]]; then
       run_review "$pr" "$REVIEW_PROMPT" "$OPENAI_MODEL" "OpenAI" "$context_file" 2 "openai" &
       pids+=($!)
       reviewer_names+=("OpenAI")

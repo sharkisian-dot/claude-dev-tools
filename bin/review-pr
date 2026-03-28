@@ -379,7 +379,15 @@ run_review() {
   printf '%s\n\n' "$prompt" > "$prompt_file"
   cat "$context_file" >> "$prompt_file"
 
-  if [[ "$provider" == "gemini" || "$provider" == "openai" ]]; then
+  if [[ "$provider" == "gemini-cli" ]]; then
+    review_output=$(gemini --yolo -p "Respond with ONLY a JSON object, no markdown fences." \
+      < "$prompt_file" \
+      2>"$review_stderr") || {
+        err "${reviewer_name} review failed for PR #${pr}:"
+        cat "$review_stderr" >&2
+        return 1
+      }
+  elif [[ "$provider" == "gemini" || "$provider" == "openai" ]]; then
     review_output=$(python3 "${DEVTOOLS_ROOT}/lib/call-model.py" \
       --provider "$provider" \
       --model "$model" \
@@ -540,7 +548,7 @@ main() {
       --force)               FORCE_REVIEW=true;           shift ;;
       --use-gemini)          USE_GEMINI=true;           shift ;;
       --use-openai)          USE_OPENAI=true;           shift ;;
-      --skip-gemini)         SKIP_GEMINI=true;          shift ;;
+      --skip-gemini|--skip-antigravity) SKIP_GEMINI=true;  shift ;;
       --skip-openai)         SKIP_OPENAI=true;          shift ;;
       --gemini-model)        GEMINI_MODEL="$2";         shift 2 ;;
       --openai-model)        OPENAI_MODEL="$2";         shift 2 ;;
@@ -575,6 +583,15 @@ ${OUTPUT_FORMAT}"
   SECURITY_PROMPT="$(load_agent "review-security")
 
 ${OUTPUT_FORMAT}"
+  local _ag_agent
+  _ag_agent="$(load_agent "review-antigravity" 2>/dev/null || echo "")"
+  if [[ -n "$_ag_agent" ]]; then
+    ANTIGRAVITY_PROMPT="${_ag_agent}
+
+${OUTPUT_FORMAT}"
+  else
+    ANTIGRAVITY_PROMPT=""
+  fi
 
   while IFS= read -r pr; do
     [[ -z "$pr" ]] && continue
@@ -671,10 +688,21 @@ ${OUTPUT_FORMAT}"
     if [[ $critical_count -eq 0 ]]; then
       local ext_pids=()
 
-      if [[ "$USE_GEMINI" == "true" ]] || [[ -n "${GOOGLE_API_KEY:-}" && "$SKIP_GEMINI" != "true" ]]; then
-        run_review "$pr" "$REVIEW_PROMPT" "$GEMINI_MODEL" "Gemini" "$context_file" 2 "gemini" &
-        ext_pids+=($!)
-        ext_reviewer_names+=("Gemini")
+      if [[ "$SKIP_GEMINI" != "true" ]]; then
+        local gemini_provider=""
+        if command -v gemini &>/dev/null; then
+          gemini_provider="gemini-cli"
+        elif [[ -n "${GOOGLE_API_KEY:-}" ]]; then
+          err "⚠ Gemini CLI not found — falling back to API. Fix: npm i -g @google/gemini-cli"
+          gemini_provider="gemini"
+        fi
+        if [[ -n "$gemini_provider" ]]; then
+          local ag_prompt="${ANTIGRAVITY_PROMPT}"
+          [[ -z "$ag_prompt" ]] && ag_prompt="${REVIEW_PROMPT}"
+          run_review "$pr" "$ag_prompt" "$GEMINI_MODEL" "Antigravity" "$context_file" 2 "$gemini_provider" &
+          ext_pids+=($!)
+          ext_reviewer_names+=("Antigravity")
+        fi
       fi
 
       if [[ "$USE_OPENAI" == "true" ]] || [[ -n "${OPENAI_API_KEY:-}" && "$SKIP_OPENAI" != "true" ]]; then

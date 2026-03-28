@@ -1043,6 +1043,23 @@ else
   # ── Initialize cost tracking ───────────────────────────────────────────────
   duration_log_init "$LOCK_DIR/duration-report.jsonl"
 
+  # ── Sync with origin/main before starting relay work ───────────────────────
+  _current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+  if [[ "$PR_MODE" == true && "$_current_branch" != "main" && "$_current_branch" != "master" ]]; then
+    info "Syncing with origin/main before relay start..."
+    if git fetch origin main 2>/dev/null; then
+      if git merge --ff-only origin/main 2>/dev/null; then
+        info "Synced with main (fast-forward)"
+      elif git diff --quiet 2>/dev/null && git diff --cached --quiet 2>/dev/null; then
+        warn "Cannot fast-forward — branches have diverged. Consider rebasing manually before running relay."
+      else
+        warn "Cannot sync — working tree has uncommitted changes. Continuing without sync."
+      fi
+    else
+      warn "Could not fetch origin/main — continuing with current state"
+    fi
+  fi
+
   # ── PR mode: create a branch ────────────────────────────────────────────────
   if [[ "$PR_MODE" == true ]]; then
     RELAY_BRANCH="relay/$(date +%Y-%m-%d-%H%M%S)"

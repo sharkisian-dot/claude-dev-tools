@@ -16,6 +16,50 @@ import urllib.request
 import urllib.error
 
 
+# ── Cost logging ─────────────────────────────────────────────────────────────
+PRICING: dict[str, tuple[float, float]] = {
+    # model: (input_price_per_1M, output_price_per_1M)
+    "gemini-3.1-pro-preview": (1.25, 10.0),
+    "gemini-2.5-pro-preview": (1.25, 10.0),
+    "gemini-2.5-flash": (0.075, 0.30),
+    "gemini-2.0-flash": (0.10, 0.40),
+    "gpt-5.4-2026-03-05": (2.50, 10.0),
+    "gpt-4.1": (2.00, 8.0),
+    "gpt-4o": (2.50, 10.0),
+    "gpt-4o-mini": (0.15, 0.60),
+}
+
+
+def _log_cost(provider: str, model: str, usage: dict) -> None:
+    log_file = os.environ.get("COST_LOG_FILE")
+    if not log_file:
+        return
+    import datetime
+    prompt_tokens = usage.get("promptTokenCount") or usage.get("prompt_tokens") or 0
+    completion_tokens = usage.get("candidatesTokenCount") or usage.get("completion_tokens") or 0
+    total_tokens = usage.get("totalTokenCount") or usage.get("total_tokens") or (prompt_tokens + completion_tokens)
+    pricing = PRICING.get(model)
+    if pricing:
+        cost_usd: float | None = (prompt_tokens * pricing[0] + completion_tokens * pricing[1]) / 1_000_000
+    else:
+        print(f"[cost] Unknown model '{model}' — cost not calculated", file=sys.stderr)
+        cost_usd = None
+    entry = {
+        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "provider": provider,
+        "model": model,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "cost_usd": cost_usd,
+    }
+    try:
+        with open(log_file, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass
+
+
 def call_gemini(prompt: str, model: str) -> str:
     api_key = os.environ.get("GOOGLE_API_KEY")
     if not api_key:
@@ -47,6 +91,7 @@ def call_gemini(prompt: str, model: str) -> str:
             text_parts = [p["text"] for p in parts if p.get("text") and not p.get("thought")]
             if not text_parts:
                 raise RuntimeError(f"Gemini empty response (finishReason: {data.get('candidates', [{}])[0].get('finishReason')})")
+            _log_cost("gemini", model, data.get("usageMetadata", {}))
             return text_parts[-1]
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
@@ -95,6 +140,7 @@ def call_openai(prompt: str, model: str) -> str:
         try:
             with urllib.request.urlopen(req, timeout=180) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
+            _log_cost("openai", model, data.get("usage", {}))
             return data["choices"][0]["message"]["content"]
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")

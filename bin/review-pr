@@ -39,6 +39,10 @@ source "${LIB_DIR}/agents.sh"
 
 cd "$REPO_ROOT"
 
+COST_LOG_DIR="${REPO_ROOT}/.devtools-logs"
+mkdir -p "$COST_LOG_DIR"
+export COST_LOG_FILE="${COST_LOG_DIR}/costs-$(date +%Y-%m).jsonl"
+
 MAX_CONTEXT_BYTES="${MAX_CONTEXT_BYTES:-600000}"  # ~150K tokens — leaves room for prompt + response in 200K window
 
 # ── Temp file cleanup ────────────────────────────────────────────────────────
@@ -495,6 +499,31 @@ run_test_suite() {
   fi
 }
 
+# ── Cost summary ─────────────────────────────────────────────────────────────
+
+print_cost_summary() {
+  [[ -f "$COST_LOG_FILE" ]] || return
+  python3 - "$COST_LOG_FILE" <<'PYEOF'
+import json, sys
+from pathlib import Path
+log_file = Path(sys.argv[1])
+lines = [json.loads(l) for l in log_file.read_text().splitlines() if l.strip()]
+if not lines:
+    sys.exit(0)
+total = sum(l.get("cost_usd") or 0 for l in lines)
+by_provider: dict = {}
+for l in lines:
+    p = l.get("provider", "unknown")
+    by_provider[p] = by_provider.get(p, 0) + (l.get("cost_usd") or 0)
+print(f"\n💰 PR review costs this month: ${total:.4f}")
+for p, c in sorted(by_provider.items()):
+    print(f"   {p}: ${c:.4f}")
+if total > 20.0:
+    print(f"\n⚠️  WARNING: Monthly PR review AI cost (${total:.2f}) exceeds $20.")
+    print("   Consider: --skip-gemini --skip-openai or switching to lighter models.")
+PYEOF
+}
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 main() {
@@ -718,6 +747,7 @@ _Review completed at commit ${head_sha:0:7}. Use \`review-pr --incremental\` to 
     echo ""
   done <<< "$prs"
 
+  print_cost_summary
   info "Done."
 }
 

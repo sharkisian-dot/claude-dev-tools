@@ -29,6 +29,7 @@
 #   relay-race --no-auto-merge  # create PR but don't auto-merge
 #   relay-race --skip-security     # skip security reviewer in PR review
 #   relay-race --resume           # resume interrupted relay from state file
+#   relay-race --skip-backlog   # skip PR backlog priority loop
 
 set -eo pipefail
 cd "$(git rev-parse --show-toplevel)"
@@ -57,6 +58,7 @@ PR_MODE=true
 AUTO_MERGE=true
 STRICT_CONFLICTS=false
 RESUME_MODE=false
+SKIP_BACKLOG=false
 TASKS_FILE="${RELAY_TASKS_FILE}"
 LOCK_DIR="${RELAY_LOCK_DIR}"
 RELAY_BRANCH=""
@@ -82,6 +84,7 @@ while [[ $# -gt 0 ]]; do
     --no-auto-merge)     AUTO_MERGE=false;            shift ;;
     --strict-conflicts)  STRICT_CONFLICTS=true;       shift ;;
     --resume)            RESUME_MODE=true;              shift ;;
+    --skip-backlog)      SKIP_BACKLOG=true;             shift ;;
     --tasks)             TASKS_FILE="$2";             shift 2 ;;
     -h|--help)
       sed -n '2,32p' "$0" | grep '^#' | sed 's/^# \?//'
@@ -1029,6 +1032,135 @@ load_resume_state() {
   fi
 }
 
+# ── PR Backlog Priority Loop ──────────────────────────────────────────────────
+#
+# Runs at relay start (before new tasks). Processes open PRs in priority order:
+#  1. Merge: approved + CI green → gh pr merge --squash
+#  2. Fix: changes requested → fix-loop
+#  3. Rescue: orphan (no review, >30 min old, not draft) → review-pr
+#
+# Skip with --skip-backlog. Logs to .relay-locks/backlog-actions.jsonl.
+#
+run_backlog_loop() {
+  command -v gh >/dev/null 2>&1 || { echo "  ⏭️  gh not available — skipping backlog loop"; return 0; }
+
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "📋 PR Backlog Priority Loop..."
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+  local pr_data
+  pr_data=$(gh pr list --state open --base main \
+    --json number,title,reviewDecision,updatedAt,statusCheckRollup,isDraft 2>/dev/null) || {
+    echo "  ⚠️  Could not fetch PR list — skipping backlog loop"
+    return 0
+  }
+
+  if [[ -z "$pr_data" || "$pr_data" == "[]" || "$pr_data" == "null" ]]; then
+    echo "  ✓ Backlog is clear"
+    return 0
+  fi
+
+  local count; count=$(echo "$pr_data" | jq 'length')
+  echo "  Found $count open PR(s)"
+
+  local ts; ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  local merged_count=0 fixed_count=0 rescued_count=0
+
+  # ── Phase 1: Merge approved + CI-green PRs ───────────────────────────────
+  local merge_candidates
+  merge_candidates=$(echo "$pr_data" | jq -r '
+    .[] |
+    select(.isDraft | not) |
+    select(.reviewDecision == "APPROVED") |
+    select(
+      (.statusCheckRollup // []) | length == 0 or
+      all(.[]; .conclusion == "SUCCESS" or .conclusion == "SKIPPED" or .conclusion == "NEUTRAL")
+    ) |
+    .number | tostring
+  ')
+  for pr_num in $merge_candidates; do
+    [[ -z "$pr_num" ]] && continue
+    local pr_title; pr_title=$(echo "$pr_data" | jq -r --argjson n "$pr_num" '.[] | select(.number == $n) | .title')
+    echo "  🟢 [PR #$pr_num] Merging: $pr_title"
+    if gh pr merge "$pr_num" --squash --delete-branch 2>&1; then
+      echo "     ✓ Merged"
+      printf '{"ts":"%s","action":"merge","pr":%s}\n' "$ts" "$pr_num" >> "$LOCK_DIR/backlog-actions.jsonl"
+      (( merged_count++ )) || true
+    else
+      echo "     ⚠️  Merge failed — check PR status"
+    fi
+  done
+
+  # Re-fetch after merges
+  if (( merged_count > 0 )); then
+    pr_data=$(gh pr list --state open --base main \
+      --json number,title,reviewDecision,updatedAt,statusCheckRollup,isDraft 2>/dev/null) || pr_data="[]"
+  fi
+
+  # ── Phase 2: Fix PRs with changes requested ──────────────────────────────
+  local fix_candidates
+  fix_candidates=$(echo "$pr_data" | jq -r '
+    .[] | select(.isDraft | not) | select(.reviewDecision == "CHANGES_REQUESTED") | .number | tostring
+  ')
+  local _fix_script=""
+  if [[ -x "${DEVTOOLS_ROOT}/bin/fix-loop" ]]; then
+    _fix_script="${DEVTOOLS_ROOT}/bin/fix-loop"
+  elif [[ -x "${REPO_ROOT}/scripts/fix-loop.sh" ]]; then
+    _fix_script="${REPO_ROOT}/scripts/fix-loop.sh"
+  fi
+  for pr_num in $fix_candidates; do
+    [[ -z "$pr_num" ]] && continue
+    local pr_title; pr_title=$(echo "$pr_data" | jq -r --argjson n "$pr_num" '.[] | select(.number == $n) | .title')
+    echo "  🔧 [PR #$pr_num] Fixing: $pr_title"
+    if [[ -n "$_fix_script" ]]; then
+      if bash "$_fix_script" "$pr_num" 2>&1; then
+        printf '{"ts":"%s","action":"fix","pr":%s}\n' "$ts" "$pr_num" >> "$LOCK_DIR/backlog-actions.jsonl"
+        (( fixed_count++ )) || true
+      else
+        echo "     ⚠️  Fix failed — will need manual attention"
+      fi
+    else
+      echo "     ⚠️  fix-loop not found — skipping PR #$pr_num"
+    fi
+  done
+
+  # ── Phase 3: Rescue orphan PRs ────────────────────────────────────────────
+  local now_epoch; now_epoch=$(date +%s)
+  local orphan_candidates
+  orphan_candidates=$(echo "$pr_data" | jq -r --argjson cutoff "$(( now_epoch - 1800 ))" '
+    .[] |
+    select(.isDraft | not) |
+    select(.reviewDecision == null or .reviewDecision == "" or .reviewDecision == "REVIEW_REQUIRED") |
+    select((.updatedAt | fromdateiso8601) <= $cutoff) |
+    .number | tostring
+  ')
+  local _review_script=""
+  if [[ -x "${DEVTOOLS_ROOT}/bin/review-pr" ]]; then
+    _review_script="${DEVTOOLS_ROOT}/bin/review-pr"
+  elif [[ -x "${REPO_ROOT}/scripts/review-pr.sh" ]]; then
+    _review_script="${REPO_ROOT}/scripts/review-pr.sh"
+  fi
+  for pr_num in $orphan_candidates; do
+    [[ -z "$pr_num" ]] && continue
+    local pr_title; pr_title=$(echo "$pr_data" | jq -r --argjson n "$pr_num" '.[] | select(.number == $n) | .title')
+    echo "  🆘 [PR #$pr_num] Rescuing orphan: $pr_title"
+    if [[ -n "$_review_script" ]]; then
+      if bash "$_review_script" "$pr_num" 2>&1; then
+        printf '{"ts":"%s","action":"rescue","pr":%s}\n' "$ts" "$pr_num" >> "$LOCK_DIR/backlog-actions.jsonl"
+        (( rescued_count++ )) || true
+      else
+        echo "     ⚠️  Review failed"
+      fi
+    else
+      echo "     ⚠️  review-pr not found — skipping PR #$pr_num"
+    fi
+  done
+
+  echo ""
+  echo "  📋 Backlog: $merged_count merged, $fixed_count fixed, $rescued_count rescued"
+}
+
 # ── Main execution loop ────────────────────────────────────────────────────────
 pending_gate_pids=()   # PIDs of background gate subshells (test-review + simplify)
 TOTAL_LAUNCHED=0
@@ -1075,6 +1207,11 @@ echo "   parallel: ${MAX_PARALLEL}  |  file: ${TASKS_FILE}"
 [[ "$USE_GEMINI" == true ]] && echo "   agent: Gemini → Claude fallback" \
                              || echo "   agent: Claude"
 echo ""
+
+# ── PR Backlog Priority Loop (runs before new tasks) ─────────────────────────
+if [[ "$SKIP_BACKLOG" != true && "$RESUME_MODE" != true ]]; then
+  run_backlog_loop
+fi
 
 while true; do
 

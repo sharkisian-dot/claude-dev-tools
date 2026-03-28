@@ -442,7 +442,7 @@ post_commit_status() {
   local state=$1 description=$2 context=${3:-"PR Review Gate"}
   [[ -z "${PR_NUMBER:-}" ]] && return  # not a PR run, skip
   local sha
-  sha=$(gh pr view "$PR_NUMBER" --json headRefOid -q .headRefOid 2>/dev/null) || return
+  sha=$(gh pr view "$PR_NUMBER" --json headRefOid -q .headRefOid 2>/dev/null) || return 0
   [[ -z "$sha" ]] && return
   gh api "repos/{owner}/{repo}/statuses/$sha" \
     -f state="$state" \
@@ -502,7 +502,7 @@ run_test_suite() {
 # ── Cost summary ─────────────────────────────────────────────────────────────
 
 print_cost_summary() {
-  [[ -f "$COST_LOG_FILE" ]] || return
+  [[ -f "$COST_LOG_FILE" ]] || return 0
   python3 - "$COST_LOG_FILE" <<'PYEOF'
 import json, sys
 from pathlib import Path

@@ -393,8 +393,28 @@ run_review() {
 
   post_review "$pr" "$review_json" "$reviewer_name"
 
+  # Write verdict to temp file for aggregation by parent process
+  # Uses $$ which in bash subshells resolves to the parent PID
+  local verdict_file="/tmp/review-verdict-${reviewer_name}-$$"
+  echo "$verdict" > "$verdict_file"
+
   # Log review metrics
   printf '%s' "$review_json" | log_review_issues "review-pr:${reviewer_name}" "PR#${pr}" "-"
+}
+
+# ── Post commit status to GitHub ─────────────────────────────────────────────
+
+post_commit_status() {
+  local state=$1 description=$2
+  [[ -z "${PR_NUMBER:-}" ]] && return  # not a PR run, skip
+  local sha
+  sha=$(gh pr view "$PR_NUMBER" --json headRefOid -q .headRefOid 2>/dev/null) || return
+  [[ -z "$sha" ]] && return
+  gh api "repos/{owner}/{repo}/statuses/$sha" \
+    -f state="$state" \
+    -f context="PR Review Gate" \
+    -f description="$description" \
+    --silent 2>/dev/null || true
 }
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -468,8 +488,12 @@ ${OUTPUT_FORMAT}"
     context_size=$(wc -c < "$context_file" | tr -d ' ')
     log "Context: $(( context_size / 1024 ))KB (~$(( context_size / 4 / 1000 ))K tokens)"
 
+    # Post pending status before reviewers run
+    post_commit_status "pending" "Reviewers running…"
+
     # Run all reviewers in parallel
     local pids=()
+    local reviewer_names=("Sonnet" "Opus Architect")
 
     run_review "$pr" "$REVIEW_PROMPT" "sonnet" "Sonnet" "$context_file" &
     pids+=($!)
@@ -480,22 +504,47 @@ ${OUTPUT_FORMAT}"
     if [[ "$SKIP_TEST_COVERAGE" != "true" ]]; then
       run_review "$pr" "$TEST_COVERAGE_PROMPT" "sonnet" "Test Coverage" "$context_file" &
       pids+=($!)
+      reviewer_names+=("Test Coverage")
     fi
 
     if [[ "$SKIP_FILE_ORG" != "true" ]]; then
       run_review "$pr" "$FILE_ORG_PROMPT" "sonnet" "File Organization" "$context_file" &
       pids+=($!)
+      reviewer_names+=("File Organization")
     fi
 
     if [[ "$SKIP_SECURITY" != "true" ]]; then
       run_review "$pr" "$SECURITY_PROMPT" "sonnet" "Security" "$context_file" &
       pids+=($!)
+      reviewer_names+=("Security")
     fi
 
     # Wait for all reviewers
     for pid in "${pids[@]}"; do
       wait "$pid" 2>/dev/null || true
     done
+
+    # Aggregate verdicts from temp files written by run_review subprocesses
+    local changes_count=0
+    local total_count=0
+    for reviewer_name in "${reviewer_names[@]}"; do
+      local verdict_file="/tmp/review-verdict-${reviewer_name}-$$"
+      if [[ -f "$verdict_file" ]]; then
+        local v
+        v=$(cat "$verdict_file")
+        total_count=$(( total_count + 1 ))
+        [[ "$v" == "request_changes" ]] && changes_count=$(( changes_count + 1 ))
+        rm -f "$verdict_file"
+      fi
+    done
+
+    if [[ $changes_count -gt 0 ]]; then
+      post_commit_status "failure" "${changes_count} reviewer(s) requested changes"
+      info "PR #${pr}: Aggregate verdict — FAILURE (${changes_count}/${total_count} requested changes)"
+    else
+      post_commit_status "success" "All reviewers approved"
+      info "PR #${pr}: Aggregate verdict — SUCCESS (all ${total_count} reviewers approved)"
+    fi
 
     # Post incremental review marker (tracks which SHA was last reviewed)
     local head_sha

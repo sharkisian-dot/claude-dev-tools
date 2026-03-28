@@ -9,10 +9,16 @@ variables:
   - TEST_COMMAND
 ---
 
-You are completing a specific relay race task. Read {{TASKS_FILE}} to get full task details.
+You are completing a specific relay race task.
 
 YOUR TASK: {{TASK_ID}}
 Task line: {{TASK_LINE}}
+
+Task description (from GitHub Issue body, if available):
+{{TASK_BODY}}
+
+If the task description above is non-empty, use it as the authoritative task specification.
+Otherwise, read {{TASKS_FILE}} to get full task details.
 
 ── PHASE 1: SCOUT (before writing any code) ──────────────────────────
 Read the files mentioned in the task description. Verify the problem still exists.
@@ -29,7 +35,7 @@ Read the files mentioned in the task description. Verify the problem still exist
 3. If the task requires a DESIGN DECISION that could go either way AND the
    impact is large (new API shape, schema change, shared interface contract):
    → Write to {{LOCK_DIR}}/done-{{TASK_ID}}: SCOUT: BLOCKED — [decision needed]
-     Include: what the decision is, option A vs option B, your recommendation.
+   Include: what the decision is, option A vs option B, your recommendation.
    → Exit immediately. Do not write any code.
 
 4. Otherwise: proceed to Phase 2.
@@ -37,15 +43,17 @@ Read the files mentioned in the task description. Verify the problem still exist
 ── PHASE 2: IMPLEMENT ────────────────────────────────────────────────
 
 RULES:
+
 1. Complete ONLY Task {{TASK_ID}} — do not touch other tasks
 2. Run diagnostic tests when done: {{TEST_COMMAND}}
 3. When finished, write a 1-2 sentence completion summary to:
-     {{LOCK_DIR}}/done-{{TASK_ID}}
+   {{LOCK_DIR}}/done-{{TASK_ID}}
 4. DO NOT modify {{TASKS_FILE}} — the relay script handles that
 5. DO NOT commit — the relay script handles that
 6. Exit immediately after writing the done file
 
 VISUAL VERIFICATION:
+
 - Check if the dev server is running: curl -sf http://localhost:{{DEV_PORT}} >/dev/null
 - If the server IS running AND this task touched UI files:
   - Identify up to 3 pages affected
@@ -57,5 +65,9 @@ VISUAL VERIFICATION:
 - If the server is NOT running or no UI files were touched:
   - Append: VISUAL: SKIPPED [reason]
 
-If the task scope is too large, break it into subtasks in {{TASKS_FILE}}
-and write the new task IDs to {{LOCK_DIR}}/done-{{TASK_ID}} instead of implementing.
+If the task scope is too large, break it into subtasks:
+
+- If RELAY_SOURCE=issues (check env var): create GitHub Issues:
+  `gh issue create --milestone $RELAY_MILESTONE --label "model:sonnet,status:pending,relay" --title "..." --body "..."`
+- Otherwise: append subtasks to {{TASKS_FILE}}
+  Write the new task IDs to {{LOCK_DIR}}/done-{{TASK_ID}} instead of implementing.

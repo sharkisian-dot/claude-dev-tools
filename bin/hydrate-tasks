@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# hydrate-tasks — Generate tasks.json from GitHub Issues for a relay run
+#
+# Usage:
+#   hydrate-tasks [--milestone MILESTONE] [--output FILE]
+#
+# Generates a tasks.json from GitHub Issues in a milestone.
+# If --milestone is omitted, auto-generates one named relay-YYYYMMDD-HHMMSS and creates it.
+# If the milestone doesn't exist, it is created automatically.
+#
+# Output format:
+#   {
+#     "relay_label": "relay-YYYYMMDD-HHMMSS",
+#     "source": "issues",
+#     "tasks": [
+#       {
+#         "id": "TASK-175",
+#         "issue": 175,
+#         "title": "...",
+#         "model": "sonnet",
+#         "status": "pending",
+#         "depends_on": [],
+#         "body": "full issue body"
+#       }
+#     ]
+#   }
+
+set -eo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../lib/config.sh"
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+MILESTONE=""
+OUTPUT_FILE=".relay-tasks.json"
+
+# ── Arg parsing ───────────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --milestone|-m) MILESTONE="$2"; shift 2 ;;
+    --output|-o)    OUTPUT_FILE="$2"; shift 2 ;;
+    -h|--help)
+      sed -n '2,16p' "$0" | grep '^#' | sed 's/^# \?//'
+      exit 0 ;;
+    *) echo "Unknown option: $1  (use --help)"; exit 1 ;;
+  esac
+done
+
+# ── Check dependencies ────────────────────────────────────────────────────────
+if ! command -v gh >/dev/null 2>&1; then
+  echo "Error: gh (GitHub CLI) is required" >&2
+  exit 1
+fi
+if ! command -v jq >/dev/null 2>&1; then
+  echo "Error: jq is required" >&2
+  exit 1
+fi
+
+# ── Auto-generate milestone name if not provided ──────────────────────────────
+if [[ -z "$MILESTONE" ]]; then
+  MILESTONE="relay-$(date +%Y%m%d-%H%M%S)"
+  echo "Auto-generating milestone: $MILESTONE"
+fi
+
+# ── Ensure milestone exists (create if missing) ───────────────────────────────
+existing_milestone=$(gh api "repos/{owner}/{repo}/milestones" --jq ".[] | select(.title == \"$MILESTONE\") | .title" 2>/dev/null || true)
+
+if [[ -z "$existing_milestone" ]]; then
+  echo "Creating milestone: $MILESTONE"
+  gh api "repos/{owner}/{repo}/milestones" -f "title=$MILESTONE" >/dev/null
+fi
+
+# ── Fetch issues from milestone ───────────────────────────────────────────────
+echo "Fetching issues for milestone: $MILESTONE"
+issue_data=$(gh issue list \
+  --milestone "$MILESTONE" \
+  --json number,title,labels,body,state \
+  --limit 200 \
+  2>/dev/null)
+
+if [[ -z "$issue_data" || "$issue_data" == "[]" || "$issue_data" == "null" ]]; then
+  echo "No issues found in milestone: $MILESTONE"
+  # Write empty tasks.json so relay can start
+  jq -nc \
+    --arg label "$MILESTONE" \
+    '{"relay_label": $label, "source": "issues", "tasks": []}' \
+    > "$OUTPUT_FILE"
+  echo "Written: $OUTPUT_FILE (empty)"
+  exit 0
+fi
+
+# ── Parse issues into tasks.json format ──────────────────────────────────────
+# For each issue:
+#   - Extract model from labels (model:* → strip prefix, default: sonnet)
+#   - Extract depends_on from body (**Depends on:** #N, #M → array of ints)
+#   - Set status=pending for open issues, done for closed
+#   - Generate task ID from issue number (TASK-<N>)
+tasks_json=$(echo "$issue_data" | jq '
+  [.[] | {
+    id: ("TASK-" + (.number | tostring)),
+    issue: .number,
+    title: .title,
+    model: (
+      (.labels // []) |
+      map(select(.name | startswith("model:"))) |
+      if length > 0 then .[0].name | ltrimstr("model:") else "sonnet" end
+    ),
+    status: (if .state == "CLOSED" then "done" else "pending" end),
+    depends_on: (
+      (.body // "") |
+      capture("\\*\\*Depends on:\\*\\*[[:space:]]*(?P<deps>[^\\n]+)") |
+      if . == null then []
+      else
+        .deps |
+        split(",") |
+        map(
+          ltrimstr(" ") | ltrimstr("#") | rtrimstr(" ") |
+          if test("^[0-9]+$") then tonumber else empty end
+        )
+      end
+    ),
+    body: (.body // "")
+  }]
+')
+
+# Build final tasks.json
+jq -nc \
+  --arg label "$MILESTONE" \
+  --argjson tasks "$tasks_json" \
+  '{"relay_label": $label, "source": "issues", "tasks": $tasks}' \
+  > "$OUTPUT_FILE"
+
+task_count=$(echo "$tasks_json" | jq 'length')
+echo "Written: $OUTPUT_FILE ($task_count task(s) from milestone '$MILESTONE')"

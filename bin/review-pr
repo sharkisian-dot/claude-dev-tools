@@ -380,7 +380,8 @@ run_review() {
   cat "$context_file" >> "$prompt_file"
 
   if [[ "$provider" == "gemini-cli" ]]; then
-    review_output=$(gemini --yolo -p "Respond with ONLY a JSON object, no markdown fences." \
+    review_output=$(gemini --yolo --model "$model" \
+      -p "Respond with ONLY a JSON object, no markdown fences." \
       < "$prompt_file" \
       2>"$review_stderr") || {
         err "${reviewer_name} review failed for PR #${pr}:"

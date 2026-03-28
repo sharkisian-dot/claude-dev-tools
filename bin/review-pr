@@ -12,6 +12,10 @@
 #   devtools review-pr --incremental 18         # only review new commits since last review
 #   devtools review-pr --max-diff-lines 1200 18 # adjust max diff line threshold
 #   devtools review-pr --force 18              # review even if diff exceeds limit
+#   devtools review-pr --skip-gemini 18        # disable Gemini even if GOOGLE_API_KEY is set
+#   devtools review-pr --skip-openai 18        # disable OpenAI even if OPENAI_API_KEY is set
+#   devtools review-pr --gemini-model gemini-2.5-flash 18
+#   devtools review-pr --openai-model gpt-4o 18
 #
 # Reviewers (all run in parallel):
 #   1. Sonnet correctness — bugs, error handling, data integrity
@@ -19,9 +23,12 @@
 #   3. Sonnet test coverage — missing tests for changed code
 #   4. Sonnet file organization — structural problems, repo hygiene
 #   5. Sonnet security — vulnerabilities, secrets, auth, injection
+#   6. Gemini 3.1 Pro — auto-enabled when GOOGLE_API_KEY is set (--skip-gemini to disable)
+#   7. GPT-5.4 — auto-enabled when OPENAI_API_KEY is set (--skip-openai to disable)
 #
 # Requires: claude CLI (authenticated), gh CLI (authenticated)
-# Cost: $0 — uses your Claude subscription, not API tokens
+# Cost: $0 for Claude — uses your Claude subscription, not API tokens
+#       Gemini/OpenAI reviewers use API keys (GOOGLE_API_KEY / OPENAI_API_KEY)
 
 set -eo pipefail
 
@@ -47,6 +54,12 @@ AUTO_APPROVE="${AUTO_APPROVE:-false}"
 SKIP_TEST_COVERAGE="${SKIP_TEST_COVERAGE:-false}"
 SKIP_FILE_ORG="${SKIP_FILE_ORG:-false}"
 SKIP_SECURITY="${SKIP_SECURITY:-false}"
+USE_GEMINI="${USE_GEMINI:-false}"
+USE_OPENAI="${USE_OPENAI:-false}"
+SKIP_GEMINI="${SKIP_GEMINI:-false}"
+SKIP_OPENAI="${SKIP_OPENAI:-false}"
+GEMINI_MODEL="${GEMINI_MODEL:-gemini-3.1-pro-preview}"
+OPENAI_MODEL="${OPENAI_MODEL:-gpt-5.4-2026-03-05}"
 PR_NUMBER="${PR_NUMBER:-}"
 MAX_DIFF_LINES="${MAX_DIFF_LINES:-800}"
 FORCE_REVIEW="${FORCE_REVIEW:-false}"
@@ -348,6 +361,7 @@ run_review() {
   local reviewer_name="$4"
   local context_file="$5"
   local max_turns="${6:-2}"
+  local provider="${7:-claude}"  # claude | gemini | openai
 
   info "PR #${pr}: Running ${reviewer_name} review..."
 
@@ -357,20 +371,32 @@ run_review() {
   TEMP_FILES+=("$review_stderr" "$prompt_file")
 
   # Write combined prompt+context to a temp file to avoid ARG_MAX limits,
-  # then feed it via stdin (claude -p -) rather than as a shell argument.
+  # then feed it via stdin rather than as a shell argument.
   printf '%s\n\n' "$prompt" > "$prompt_file"
   cat "$context_file" >> "$prompt_file"
 
-  review_output=$(env -u CLAUDECODE claude -p - \
-    --model "$model" \
-    --output-format text \
-    --max-turns "$max_turns" \
-    < "$prompt_file" \
-    2>"$review_stderr") || {
-      err "${reviewer_name} review failed for PR #${pr}:"
-      cat "$review_stderr" >&2
-      return 1
-    }
+  if [[ "$provider" == "gemini" || "$provider" == "openai" ]]; then
+    review_output=$(python3 "${DEVTOOLS_ROOT}/lib/call-model.py" \
+      --provider "$provider" \
+      --model "$model" \
+      < "$prompt_file" \
+      2>"$review_stderr") || {
+        err "${reviewer_name} review failed for PR #${pr}:"
+        cat "$review_stderr" >&2
+        return 1
+      }
+  else
+    review_output=$(env -u CLAUDECODE claude -p - \
+      --model "$model" \
+      --output-format text \
+      --max-turns "$max_turns" \
+      < "$prompt_file" \
+      2>"$review_stderr") || {
+        err "${reviewer_name} review failed for PR #${pr}:"
+        cat "$review_stderr" >&2
+        return 1
+      }
+  fi
 
   local review_json
   review_json=$(parse_review_json "$review_output")
@@ -483,6 +509,12 @@ main() {
       --incremental)         INCREMENTAL=true;          shift ;;
       --max-diff-lines)      MAX_DIFF_LINES="$2";        shift 2 ;;
       --force)               FORCE_REVIEW=true;           shift ;;
+      --use-gemini)          USE_GEMINI=true;           shift ;;
+      --use-openai)          USE_OPENAI=true;           shift ;;
+      --skip-gemini)         SKIP_GEMINI=true;          shift ;;
+      --skip-openai)         SKIP_OPENAI=true;          shift ;;
+      --gemini-model)        GEMINI_MODEL="$2";         shift 2 ;;
+      --openai-model)        OPENAI_MODEL="$2";         shift 2 ;;
       *)                     PR_NUMBER="$1";            shift ;;
     esac
   done
@@ -545,7 +577,7 @@ ${OUTPUT_FORMAT}"
     post_commit_status "pending" "Type check pending…" "Type Check"
     post_commit_status "pending" "Test suite pending…" "Test Suite"
 
-    # Run all reviewers in parallel
+    # ── Round 1: Claude reviewers (always run) ───────────────────────────────
     local pids=()
     local reviewer_names=("Sonnet" "Opus Architect")
 
@@ -573,17 +605,16 @@ ${OUTPUT_FORMAT}"
       reviewer_names+=("Security")
     fi
 
-    # Wait for all reviewers
+    # Wait for round 1
     for pid in "${pids[@]}"; do
       wait "$pid" 2>/dev/null || true
     done
 
-    # Run type check and test suite after reviewers complete
+    # Run type check and test suite after round 1
     run_type_check
     run_test_suite
 
-    # Aggregate verdicts from temp files written by run_review subprocesses
-    # Severity-based: only [critical] issues trigger failure; [warning] issues become GitHub issues
+    # Aggregate round 1 results
     local critical_count=0
     local total_count=0
     local all_warnings=()
@@ -595,7 +626,6 @@ ${OUTPUT_FORMAT}"
         reviewer_criticals=$(jq '[.issues[] | select(.severity == "critical")] | length' < "$output_file" 2>/dev/null || echo 0)
         critical_count=$(( critical_count + reviewer_criticals ))
         total_count=$(( total_count + 1 ))
-        # Collect warning messages to file as GitHub issues
         while IFS= read -r warning_msg; do
           [[ -n "$warning_msg" ]] && all_warnings+=("$warning_msg")
         done < <(jq -r '.issues[] | select(.severity == "warning") | .message' < "$output_file" 2>/dev/null)
@@ -604,6 +634,53 @@ ${OUTPUT_FORMAT}"
       rm -f "$verdict_file"
     done
 
+    # ── Round 2: Gemini + OpenAI (only when round 1 is clean) ────────────────
+    # These reviewers add value specifically in the "Claude gave a clean pass
+    # but something might be lurking" scenario. Skip them if there are already
+    # critical issues — the PR needs fixes regardless, no second opinion needed.
+    local ext_reviewer_names=()
+    if [[ $critical_count -eq 0 ]]; then
+      local ext_pids=()
+
+      if [[ "$USE_GEMINI" == "true" ]] || [[ -n "${GOOGLE_API_KEY:-}" && "$SKIP_GEMINI" != "true" ]]; then
+        run_review "$pr" "$REVIEW_PROMPT" "$GEMINI_MODEL" "Gemini" "$context_file" 2 "gemini" &
+        ext_pids+=($!)
+        ext_reviewer_names+=("Gemini")
+      fi
+
+      if [[ "$USE_OPENAI" == "true" ]] || [[ -n "${OPENAI_API_KEY:-}" && "$SKIP_OPENAI" != "true" ]]; then
+        run_review "$pr" "$REVIEW_PROMPT" "$OPENAI_MODEL" "OpenAI" "$context_file" 2 "openai" &
+        ext_pids+=($!)
+        ext_reviewer_names+=("OpenAI")
+      fi
+
+      if [[ ${#ext_pids[@]} -gt 0 ]]; then
+        info "PR #${pr}: Round 1 clean — running external reviewers (${ext_reviewer_names[*]})..."
+        for pid in "${ext_pids[@]}"; do
+          wait "$pid" 2>/dev/null || true
+        done
+
+        # Fold round 2 results into the aggregate
+        for reviewer_name in "${ext_reviewer_names[@]}"; do
+          local output_file="/tmp/review-output-${reviewer_name}-$$"
+          local verdict_file="/tmp/review-verdict-${reviewer_name}-$$"
+          if [[ -f "$output_file" ]]; then
+            local reviewer_criticals
+            reviewer_criticals=$(jq '[.issues[] | select(.severity == "critical")] | length' < "$output_file" 2>/dev/null || echo 0)
+            critical_count=$(( critical_count + reviewer_criticals ))
+            while IFS= read -r warning_msg; do
+              [[ -n "$warning_msg" ]] && all_warnings+=("$warning_msg")
+            done < <(jq -r '.issues[] | select(.severity == "warning") | .message' < "$output_file" 2>/dev/null)
+            rm -f "$output_file"
+          fi
+          rm -f "$verdict_file"
+        done
+      fi
+    else
+      info "PR #${pr}: Round 1 found ${critical_count} critical issue(s) — skipping external reviewers"
+    fi
+
+    # ── Final aggregate ───────────────────────────────────────────────────────
     if [[ $critical_count -gt 0 ]]; then
       post_commit_status "failure" "${critical_count} critical issue(s) found"
       info "PR #${pr}: Aggregate verdict — FAILURE (${critical_count} critical issue(s))"

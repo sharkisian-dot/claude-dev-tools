@@ -1331,6 +1331,21 @@ fi
 
 save_phase "done"
 
+# ── PR size guardrail ─────────────────────────────────────────────────────────────────
+if [[ "$PR_MODE" == true ]]; then
+  diff_lines=$(git diff origin/main...HEAD --stat 2>/dev/null | tail -1 \
+    | grep -oE '[0-9]+ insertion|[0-9]+ deletion' \
+    | grep -oE '[0-9]+' \
+    | awk '{sum+=$1} END {print sum+0}')
+  warn_limit=$(config_get relay.max_pr_lines_warn 300)
+  block_limit=$(config_get relay.max_pr_lines_block 500)
+  if [[ -n "$diff_lines" && "$diff_lines" -gt "$block_limit" ]]; then
+    die "PR diff is $diff_lines lines (limit: $block_limit). Split the task and try again."
+  elif [[ -n "$diff_lines" && "$diff_lines" -gt "$warn_limit" ]]; then
+    warn "PR diff is $diff_lines lines (warning threshold: $warn_limit). Consider splitting."
+  fi
+fi
+
 # ── PR creation (if --pr mode) ───────────────────────────────────────────────
 if [[ "$PR_MODE" == true ]]; then
   echo ""

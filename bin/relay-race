@@ -296,6 +296,44 @@ check_wave_conflict() {
   return 0
 }
 
+# Best-effort check: warns if the current task's file mentions appear in open non-draft PRs.
+# Logs to .relay-locks/conflict-warnings.jsonl. Does NOT block execution.
+check_pr_file_overlap() {
+  local task_id="$1"
+  local task_body; task_body=$(get_task_body "$task_id")
+
+  # Extract path-like tokens: common dir prefixes AND extension-bearing filenames
+  local task_paths
+  task_paths=$(printf '%s\n%s' \
+    "$(extract_file_paths "$task_body")" \
+    "$(echo "$task_body" | grep -oE '[[:alnum:]_./]+(\.ts|\.tsx|\.js|\.sh|\.md|\.yaml|\.json|\.sql)' 2>/dev/null)" \
+    | sort -u | grep -v '^$')
+  [[ -z "$task_paths" ]] && return 0
+
+  # Fetch open non-draft PRs with their changed files (silent on error — best-effort)
+  local pr_data
+  pr_data=$(gh pr list --state open --json number,files,isDraft 2>/dev/null \
+    | jq 'map(select(.isDraft | not))' 2>/dev/null) || return 0
+  [[ -z "$pr_data" || "$pr_data" == "[]" || "$pr_data" == "null" ]] && return 0
+
+  local ts; ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  while IFS= read -r fpath; do
+    [[ -z "$fpath" ]] && continue
+    # Find PRs whose changed file list includes this path (exact or suffix match)
+    local pr_nums
+    pr_nums=$(echo "$pr_data" | jq -r --arg p "$fpath" \
+      '[.[] | select(any(.files[]?; .path == $p or (.path | endswith($p)))) | .number] | unique[]' \
+      2>/dev/null) || continue
+    while IFS= read -r pr_num; do
+      [[ -z "$pr_num" ]] && continue
+      echo "[conflict-check] WARNING: task may overlap with PR #${pr_num} (shared file: ${fpath})"
+      printf '{"ts":"%s","task":"%s","pr":%s,"file":"%s"}\n' \
+        "$ts" "$task_id" "$pr_num" "$fpath" >> "$LOCK_DIR/conflict-warnings.jsonl"
+    done <<< "$pr_nums"
+  done <<< "$task_paths"
+}
+
 # ── Portable file locking (macOS + Linux) ────────────────────────────────────
 # Uses mkdir for atomic locking (works on both platforms).
 # Usage: acquire_lock <name> <timeout_secs>; ...; release_lock <name>
@@ -1170,6 +1208,9 @@ while true; do
         echo "  ⚡ [${next_id}] Proceeding despite potential conflict (use --strict-conflicts to serialize)"
       fi
     fi
+
+    # PR file-overlap check (warn-only; flags files also modified in open PRs)
+    check_pr_file_overlap "$next_id"
 
     run_task "$next_id" "$next_line" "$model" &
     bg_pid=$!

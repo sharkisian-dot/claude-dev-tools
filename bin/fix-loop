@@ -412,9 +412,11 @@ run_round() {
   # Save to history for meta-review
   save_round_review "$round" "$merged_file"
 
-  # Clean — post approval and exit
-  if [[ "$issue_count" -eq 0 || "$verdict" == "approve" ]]; then
-    info "Clean! Posting approval review."
+  # Clean — exit when no critical issues remain (warnings are filed as GitHub issues, not blocking)
+  local critical_count
+  critical_count=$(jq '[.issues[] | select(.severity == "critical")] | length' < "$merged_file")
+  if [[ "$critical_count" -eq 0 ]]; then
+    info "Clean! No critical issues. Posting approval review."
     post_github_review "$PR_NUMBER" "$merged_file" "$round" "APPROVE"
     rm -f "$merged_file" "$context_file"
     return 0

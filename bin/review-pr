@@ -398,6 +398,10 @@ run_review() {
   local verdict_file="/tmp/review-verdict-${reviewer_name}-$$"
   echo "$verdict" > "$verdict_file"
 
+  # Write full review JSON for severity-based aggregation
+  local output_file="/tmp/review-output-${reviewer_name}-$$"
+  printf '%s' "$review_json" > "$output_file"
+
   # Log review metrics
   printf '%s' "$review_json" | log_review_issues "review-pr:${reviewer_name}" "PR#${pr}" "-"
 }
@@ -525,25 +529,48 @@ ${OUTPUT_FORMAT}"
     done
 
     # Aggregate verdicts from temp files written by run_review subprocesses
-    local changes_count=0
+    # Severity-based: only [critical] issues trigger failure; [warning] issues become GitHub issues
+    local critical_count=0
     local total_count=0
+    local all_warnings=()
     for reviewer_name in "${reviewer_names[@]}"; do
       local verdict_file="/tmp/review-verdict-${reviewer_name}-$$"
-      if [[ -f "$verdict_file" ]]; then
-        local v
-        v=$(cat "$verdict_file")
+      local output_file="/tmp/review-output-${reviewer_name}-$$"
+      if [[ -f "$output_file" ]]; then
+        local reviewer_criticals
+        reviewer_criticals=$(jq '[.issues[] | select(.severity == "critical")] | length' < "$output_file" 2>/dev/null || echo 0)
+        critical_count=$(( critical_count + reviewer_criticals ))
         total_count=$(( total_count + 1 ))
-        [[ "$v" == "request_changes" ]] && changes_count=$(( changes_count + 1 ))
-        rm -f "$verdict_file"
+        # Collect warning messages to file as GitHub issues
+        while IFS= read -r warning_msg; do
+          [[ -n "$warning_msg" ]] && all_warnings+=("$warning_msg")
+        done < <(jq -r '.issues[] | select(.severity == "warning") | .message' < "$output_file" 2>/dev/null)
+        rm -f "$output_file"
       fi
+      rm -f "$verdict_file"
     done
 
-    if [[ $changes_count -gt 0 ]]; then
-      post_commit_status "failure" "${changes_count} reviewer(s) requested changes"
-      info "PR #${pr}: Aggregate verdict — FAILURE (${changes_count}/${total_count} requested changes)"
+    if [[ $critical_count -gt 0 ]]; then
+      post_commit_status "failure" "${critical_count} critical issue(s) found"
+      info "PR #${pr}: Aggregate verdict — FAILURE (${critical_count} critical issue(s))"
     else
-      post_commit_status "success" "All reviewers approved"
-      info "PR #${pr}: Aggregate verdict — SUCCESS (all ${total_count} reviewers approved)"
+      post_commit_status "success" "No critical issues"
+      info "PR #${pr}: Aggregate verdict — SUCCESS (no critical issues, ${#all_warnings[@]} warning(s))"
+      # File GitHub issues for warnings (deduplicated by title)
+      for warning_msg in "${all_warnings[@]}"; do
+        local short_msg="${warning_msg:0:100}"
+        local issue_title="[review-warning] ${short_msg}"
+        local existing
+        existing=$(gh issue list --label "review-warning" --search "${issue_title}" --json number --jq '.[0].number' 2>/dev/null || echo "")
+        if [[ -z "$existing" ]]; then
+          gh issue create \
+            --title "$issue_title" \
+            --body "Automatically filed from review of PR #${pr}.
+
+Full message: ${warning_msg}" \
+            --label "review-warning" > /dev/null 2>&1 || true
+        fi
+      done
     fi
 
     # Post incremental review marker (tracks which SHA was last reviewed)

@@ -20,9 +20,9 @@ You flag drift that accumulates naturally over many relay runs.
    Run: wc -l {{RULES_FILE}}
    If > {{HYGIENE_MAX_RULES_LINES}} lines: this is a flag. The file should stay lean.
 
-2. Root-level TASKS-*.md clutter
-   Run: ls TASKS-*.md 2>/dev/null
-   Flag any TASKS-*.md files (other than TASKS.md) where ALL tasks are marked [x].
+2. Root-level TASKS-_.md clutter
+   Run: ls TASKS-_.md 2>/dev/null
+   Flag any TASKS-\*.md files (other than TASKS.md) where ALL tasks are marked [x].
    Check by: grep -c "^\- \[ \]" <file> — if result is 0, the file is fully done.
    If 3+ completed task files exist in root: flag for archiving.
 
@@ -35,16 +35,22 @@ You flag drift that accumulates naturally over many relay runs.
    Run: git log -1 --format="%ar" -- .continue-here.md
    If the file has not been modified in 14+ days: flag as stale.
 
-══ FOR EACH FLAGGED ISSUE: append a task to {{TASKS_FILE}} ══════════════════════════
+══ FOR EACH FLAGGED ISSUE: create a follow-up task ══════════════════════════════════
 
-Only append if the issue is real. Do NOT create tasks for things that are fine.
+Only create tasks if the issue is real. Do NOT create tasks for things that are fine.
 Maximum 3 tasks per gate run. Combine minor issues into one task if possible.
 Do NOT create a task if you find 0 or 1 minor issues.
+
+How to create tasks:
+
+- If RELAY_SOURCE=issues (check env var `echo $RELAY_SOURCE`): create a GitHub Issue:
+  `gh issue create --milestone "$RELAY_MILESTONE" --label "model:sonnet,status:pending,relay" --title "HG-{{NEXT_HG}}: [short description]" --body "[details]"`
+- Otherwise: append a task block to {{TASKS_FILE}}.
 
 ══ WRITE DONE-FILE ═══════════════════════════════════════════════════════════════════
 Write a short summary to: {{LOCK_DIR}}/done-HYGIENE
 
-  If all clean:   CLEAN — all checks passed
-  If tasks added: TASKS ADDED: [task IDs] — [brief reasons]
+If all clean: CLEAN — all checks passed
+If tasks added: TASKS ADDED: [task IDs] — [brief reasons]
 
-DO NOT modify any source files. DO NOT touch {{TASKS_FILE}} except to append tasks.
+DO NOT modify any source files. DO NOT touch {{TASKS_FILE}} except to append tasks (in TASKS.md mode).

@@ -6,6 +6,7 @@ Uses Claude Code CLI (`claude -p`) for agent execution.
 ## Overview
 
 This repo provides reusable scripts for:
+
 - **relay-race** — Parallel multi-agent task execution with quality gates
 - **review-pr** — 5-reviewer parallel PR review (correctness, complexity, test coverage, file org, security)
 - **fix-loop** — Automated PR review + fix + re-review loop
@@ -30,38 +31,66 @@ Projects override agents by placing files in `.devtools/agents/` with the same n
 
 ## Multi-Model Strategy
 
-| Role | Model | Script |
-|---|---|---|
-| Correctness reviewer | Sonnet | review-pr, fix-loop |
-| Complexity reviewer | Opus | review-pr, fix-loop |
-| Test coverage reviewer | Sonnet | review-pr, fix-loop |
-| File org reviewer | Sonnet | review-pr, fix-loop |
-| Security reviewer | Sonnet | review-pr, fix-loop |
-| Meta-reviewer | Sonnet | fix-loop |
-| Code fixer | Sonnet | fix-loop |
-| Task runner | Haiku/Sonnet/Opus (per task tag) | relay-race |
-| Static analysis gate | None (deterministic) | relay-race |
-| Test reviewer gate | Sonnet | relay-race |
-| Code simplifier gate | Haiku | relay-race |
-| Hygiene gate | Haiku | relay-race |
-| Review gate | Opus | relay-race |
-| Visual critique gate | Sonnet | relay-race |
-| Planning agent | Opus | opus-plan |
+| Role                   | Model                            | Script              |
+| ---------------------- | -------------------------------- | ------------------- |
+| Correctness reviewer   | Sonnet                           | review-pr, fix-loop |
+| Complexity reviewer    | Opus                             | review-pr, fix-loop |
+| Test coverage reviewer | Sonnet                           | review-pr, fix-loop |
+| File org reviewer      | Sonnet                           | review-pr, fix-loop |
+| Security reviewer      | Sonnet                           | review-pr, fix-loop |
+| Meta-reviewer          | Sonnet                           | fix-loop            |
+| Code fixer             | Sonnet                           | fix-loop            |
+| Task runner            | Haiku/Sonnet/Opus (per task tag) | relay-race          |
+| Static analysis gate   | None (deterministic)             | relay-race          |
+| Test reviewer gate     | Sonnet                           | relay-race          |
+| Code simplifier gate   | Haiku                            | relay-race          |
+| Hygiene gate           | Haiku                            | relay-race          |
+| Review gate            | Opus                             | relay-race          |
+| Visual critique gate   | Sonnet                           | relay-race          |
+| Planning agent         | Opus                             | opus-plan           |
 
-## TASKS.md Format
+## TASKS.md Format (classic mode)
 
 ```markdown
 - [ ] **Task AG-1: [sonnet] Short title**
-  Description and acceptance criteria.
+      Description and acceptance criteria.
   - Criterion 1
   - Criterion 2
 
 - [ ] **Task AG-2: [haiku] Depends on AG-1** [needs: AG-1]
-  Won't start until AG-1 is done.
+      Won't start until AG-1 is done.
 ```
 
 Tags: `[haiku]`, `[sonnet]`, `[opus]` — determines which model runs the task.
 Dependencies: `[needs: TASKID]` or `[needs: ID1, ID2]` at end of title line.
+
+## GitHub Issues Mode
+
+For persistent, cross-session task tracking, use GitHub Issues instead of TASKS.md.
+
+```bash
+devtools relay-race --issues --milestone relay-20240115 --parallel 3
+devtools relay-race --issues          # auto-generates milestone relay-YYYYMMDD-HHMMSS
+```
+
+Issue conventions:
+
+- Labels: `model:sonnet`, `status:pending`, `size:M`, `relay`
+- Dependencies in body: `**Depends on:** #174, #175` (or "none")
+- Milestone: one per relay run (e.g. `relay-20240115-143022`)
+
+Hydrate tasks.json manually from a milestone:
+
+```bash
+bin/hydrate-tasks --milestone relay-20240115 --output .relay-tasks.json
+```
+
+Set default mode in `.devtools.yaml`:
+
+```yaml
+relay:
+  source: issues # or tasks_file (default)
+```
 
 ## Relay Race Flags
 
@@ -76,6 +105,9 @@ devtools relay-race --skip-browser           # skip browser-use gate
 devtools relay-race --skip-hygiene           # skip hygiene gate
 devtools relay-race --skip-simplify          # skip code simplifier gate
 devtools relay-race --skip-security          # skip security reviewer in PR review
+devtools relay-race --issues                 # use GitHub Issues mode
+devtools relay-race --milestone NAME         # scope issues mode to this milestone
+devtools relay-race --tasks-json FILE        # explicit path to tasks.json (default: .relay-tasks.json)
 ```
 
 ## Review-PR Flags

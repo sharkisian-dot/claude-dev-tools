@@ -30,6 +30,8 @@
 #   relay-race --skip-security     # skip security reviewer in PR review
 #   relay-race --resume           # resume interrupted relay from state file
 #   relay-race --skip-backlog   # skip PR backlog priority loop
+#   relay-race --issues --milestone relay-20240115  # use GitHub Issues mode
+#   relay-race --issues         # auto-generate milestone name
 
 set -eo pipefail
 cd "$(git rev-parse --show-toplevel)"
@@ -63,6 +65,11 @@ TASKS_FILE="${RELAY_TASKS_FILE}"
 LOCK_DIR="${RELAY_LOCK_DIR}"
 RELAY_BRANCH=""
 
+# Issues mode (GitHub Issues as task source)
+RELAY_SOURCE=$(config_get "relay.source" "tasks_file")
+RELAY_MILESTONE=""
+TASKS_JSON=".relay-tasks.json"
+
 # ── Arg parsing ───────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -86,12 +93,18 @@ while [[ $# -gt 0 ]]; do
     --resume)            RESUME_MODE=true;              shift ;;
     --skip-backlog)      SKIP_BACKLOG=true;             shift ;;
     --tasks)             TASKS_FILE="$2";             shift 2 ;;
+    --issues)            RELAY_SOURCE="issues";        shift ;;
+    --milestone)         RELAY_MILESTONE="$2";         shift 2 ;;
+    --tasks-json)        TASKS_JSON="$2";              shift 2 ;;
     -h|--help)
       sed -n '2,32p' "$0" | grep '^#' | sed 's/^# \?//'
       exit 0 ;;
     *) echo "Unknown option: $1  (use --help)"; exit 1 ;;
   esac
 done
+
+# Export issues mode vars so gate agents (subprocesses) can read them
+export RELAY_SOURCE RELAY_MILESTONE TASKS_JSON
 
 mkdir -p "$LOCK_DIR"
 
@@ -203,16 +216,18 @@ task_id_of() {
   echo "$1" | sed -n 's/.*Task \([A-Z][A-Z0-9-]*[A-Z0-9]\).*/\1/p' | head -1 || true
 }
 
-# Validate task format before starting — catch malformed lines early
-while IFS= read -r line; do
-  [[ "$line" =~ ^\-\ \[\ \] ]] || continue
-  tid=$(task_id_of "$line")
-  if [[ -z "$tid" ]]; then
-    echo "⚠️  Unparseable task line (no valid Task ID found):"
-    echo "    $line"
-    echo "    Expected format: - [ ] **Task XX-1: [model] Title**"
-  fi
-done < "$TASKS_FILE"
+# Validate task format before starting — catch malformed lines early (TASKS.md mode only)
+if [[ "$RELAY_SOURCE" != "issues" ]]; then
+  while IFS= read -r line; do
+    [[ "$line" =~ ^\-\ \[\ \] ]] || continue
+    tid=$(task_id_of "$line")
+    if [[ -z "$tid" ]]; then
+      echo "⚠️  Unparseable task line (no valid Task ID found):"
+      echo "    $line"
+      echo "    Expected format: - [ ] **Task XX-1: [model] Title**"
+    fi
+  done < "$TASKS_FILE"
+fi
 
 model_of() {
   if echo "$1" | grep -q '\[haiku\]'; then echo "claude-haiku-4-5-20251001"
@@ -228,13 +243,30 @@ model_label_of() {
   fi
 }
 
+# Issues mode: convert model name (haiku/sonnet/opus) to full model ID
+model_id_from_name() {
+  case "$1" in
+    haiku)  echo "claude-haiku-4-5-20251001" ;;
+    opus)   echo "claude-opus-4-6" ;;
+    *)      echo "claude-sonnet-4-6" ;;
+  esac
+}
+
+model_label_from_name() {
+  case "$1" in
+    haiku)  echo "Haiku" ;;
+    opus)   echo "Opus" ;;
+    *)      echo "Sonnet" ;;
+  esac
+}
+
 # Returns newline-separated dep IDs from "[needs: AG-3, AG-4]" on a task line
 deps_of() {
   echo "$1" | sed -n 's/.*\[needs:[[:space:]]*\([^]]*\)\].*/\1/p' | tr ',' '\n' | tr -d ' \t' | grep -v '^$' || true
 }
 
 # Returns 0 if all deps are satisfied.
-# deps_satisfied "task line"              — checks TASKS_FILE only
+# deps_satisfied "task line"              — checks TASKS_FILE only (or tasks.json in issues mode)
 # deps_satisfied "task line" "T1 T2 T3"  — also counts space-separated virtual IDs as done
 deps_satisfied() {
   local line="$1"
@@ -246,11 +278,33 @@ deps_satisfied() {
     if [[ -n "$virtual_done_str" ]] && echo " $virtual_done_str " | grep -q " $dep "; then
       continue
     fi
-    # Check the actual TASKS_FILE
-    if ! grep -q "^\- \[x\].*Task[[:space:]]*${dep}" "$TASKS_FILE" 2>/dev/null; then
-      return 1
+    if [[ "$RELAY_SOURCE" == "issues" ]]; then
+      # In issues mode, check tasks.json status field
+      local dep_status
+      dep_status=$(jq -r --arg dep "$dep" '.tasks[] | select(.id == $dep) | .status' "$TASKS_JSON" 2>/dev/null)
+      [[ "$dep_status" == "done" ]] || return 1
+    else
+      # Check the actual TASKS_FILE
+      if ! grep -q "^\- \[x\].*Task[[:space:]]*${dep}" "$TASKS_FILE" 2>/dev/null; then
+        return 1
+      fi
     fi
   done < <(deps_of "$line")
+  return 0
+}
+
+# Issues mode: deps_satisfied by issue number (used in issues mode main loop)
+issues_deps_satisfied() {
+  local task_id="$1"
+  local deps_json
+  deps_json=$(jq -r --arg id "$task_id" '.tasks[] | select(.id == $id) | .depends_on[]?' "$TASKS_JSON" 2>/dev/null)
+  while IFS= read -r dep_issue_num; do
+    [[ -z "$dep_issue_num" ]] && continue
+    local dep_id="TASK-${dep_issue_num}"
+    local dep_status
+    dep_status=$(jq -r --arg id "$dep_id" '.tasks[] | select(.id == $id) | .status' "$TASKS_JSON" 2>/dev/null)
+    [[ "$dep_status" == "done" ]] || return 1
+  done <<< "$deps_json"
   return 0
 }
 
@@ -265,7 +319,11 @@ is_claimed() { [[ -d "$LOCK_DIR/claim-$1" ]]; }
 # until the next task line or end of file).
 get_task_body() {
   local task_id="$1"
-  awk "/\bTask[[:space:]]+${task_id}\b/{found=1; next} found && /^\- \[.?\]/{exit} found{print}" "$TASKS_FILE"
+  if [[ "$RELAY_SOURCE" == "issues" ]]; then
+    jq -r --arg id "$task_id" '.tasks[] | select(.id == $id) | .body' "$TASKS_JSON" 2>/dev/null
+  else
+    awk "/\bTask[[:space:]]+${task_id}\b/{found=1; next} found && /^\- \[.?\]/{exit} found{print}" "$TASKS_FILE"
+  fi
 }
 
 # Extracts likely file path mentions from a body of text.
@@ -371,38 +429,130 @@ do_commit() {
   release_lock "git-commit"
 }
 
-# ── Serialized TASKS.md update ────────────────────────────────────────────────
+# ── Serialized task update (TASKS.md or tasks.json) ──────────────────────────
 mark_done() {
   local task_id="$1"
-  # Truncate note to one line so it doesn't corrupt TASKS.md structure
   local note
   note=$(echo "${2:-completed}" | head -1 | cut -c1-50)
   acquire_lock "tasks-write" 60
-  # Pass bash vars via env; use single-quoted Perl so $1/$2 are Perl capture groups
-  RELAY_TASK_ID="$task_id" RELAY_NOTE="$note" perl -i -0777 -pe '
-    my ($tid, $note) = ($ENV{RELAY_TASK_ID}, $ENV{RELAY_NOTE});
-    s{^(- )\[ \]( \*\*Task \Q$tid\E\b)}{$1\[x\]$2  ✓ $note}m;
-  ' "$TASKS_FILE"
+
+  if [[ "$RELAY_SOURCE" == "issues" ]]; then
+    # Update tasks.json status
+    local tmp; tmp=$(mktemp)
+    jq --arg id "$task_id" '(.tasks[] | select(.id == $id) | .status) |= "done"' "$TASKS_JSON" > "$tmp" && mv "$tmp" "$TASKS_JSON"
+    # Close the corresponding GitHub Issue
+    local issue_num
+    issue_num=$(jq -r --arg id "$task_id" '.tasks[] | select(.id == $id) | .issue' "$TASKS_JSON" 2>/dev/null)
+    if [[ -n "$issue_num" && "$issue_num" != "null" ]]; then
+      gh issue close "$issue_num" --comment "Completed by relay-race: $note" 2>/dev/null || true
+    fi
+  else
+    # Pass bash vars via env; use single-quoted Perl so $1/$2 are Perl capture groups
+    RELAY_TASK_ID="$task_id" RELAY_NOTE="$note" perl -i -0777 -pe '
+      my ($tid, $note) = ($ENV{RELAY_TASK_ID}, $ENV{RELAY_NOTE});
+      s{^(- )\[ \]( \*\*Task \Q$tid\E\b)}{$1\[x\]$2  ✓ $note}m;
+    ' "$TASKS_FILE"
+  fi
+
   release_lock "tasks-write"
 }
 
-# ── Serialized TASKS.md update — mark as scout-blocked (needs human decision) ─
+# ── Serialized task update — mark as scout-blocked (needs human decision) ─────
 mark_blocked() {
   local task_id="$1"
-  # Truncate decision to one line so it doesn't corrupt TASKS.md structure
   local decision
   decision=$(echo "${2:-decision needed}" | head -1 | cut -c1-160)
   acquire_lock "tasks-write" 60
-  RELAY_TASK_ID="$task_id" RELAY_DECISION="$decision" perl -i -0777 -pe '
-    my ($tid, $dec) = ($ENV{RELAY_TASK_ID}, $ENV{RELAY_DECISION});
-    s{^(- )\[ \]( \*\*Task \Q$tid\E\b[^\n]*)}{$1[B]$2\n  > 🛑 BLOCKED: $dec}m;
-  ' "$TASKS_FILE"
+
+  if [[ "$RELAY_SOURCE" == "issues" ]]; then
+    # Update tasks.json status to blocked
+    local tmp; tmp=$(mktemp)
+    jq --arg id "$task_id" '(.tasks[] | select(.id == $id) | .status) |= "blocked"' "$TASKS_JSON" > "$tmp" && mv "$tmp" "$TASKS_JSON"
+    # Add comment + label on the GitHub Issue
+    local issue_num
+    issue_num=$(jq -r --arg id "$task_id" '.tasks[] | select(.id == $id) | .issue' "$TASKS_JSON" 2>/dev/null)
+    if [[ -n "$issue_num" && "$issue_num" != "null" ]]; then
+      gh issue comment "$issue_num" --body "BLOCKED by relay-race: $decision" 2>/dev/null || true
+      gh issue edit "$issue_num" --add-label "status:blocked" 2>/dev/null || true
+    fi
+  else
+    RELAY_TASK_ID="$task_id" RELAY_DECISION="$decision" perl -i -0777 -pe '
+      my ($tid, $dec) = ($ENV{RELAY_TASK_ID}, $ENV{RELAY_DECISION});
+      s{^(- )\[ \]( \*\*Task \Q$tid\E\b[^\n]*)}{$1[B]$2\n  > 🛑 BLOCKED: $dec}m;
+    ' "$TASKS_FILE"
+  fi
+
   release_lock "tasks-write"
   # Append to run-level blocked summary for final report
   echo "[$task_id] $decision" >> "$LOCK_DIR/BLOCKED-SUMMARY.txt"
 }
 
 # ── DRY-RUN: show execution plan ──────────────────────────────────────────────
+_issues_dry_run_plan() {
+  local vdone_str="" wave=1 total=0
+  mapfile -t _all_ids < <(jq -r '.tasks[] | select(.status == "pending") | .id' "$TASKS_JSON" 2>/dev/null)
+
+  while true; do
+    local wave_tasks=()
+    for tid in "${_all_ids[@]}"; do
+      echo " $vdone_str " | grep -q " $tid " && continue
+      local _deps _satisfied=true
+      _deps=$(jq -r --arg id "$tid" '.tasks[] | select(.id == $id) | .depends_on[]?' "$TASKS_JSON" 2>/dev/null)
+      while IFS= read -r _dep_num; do
+        [[ -z "$_dep_num" ]] && continue
+        local _dep_id="TASK-${_dep_num}"
+        if ! echo " $vdone_str " | grep -q " $_dep_id "; then
+          local _dep_status
+          _dep_status=$(jq -r --arg id "$_dep_id" '.tasks[] | select(.id == $id) | .status' "$TASKS_JSON" 2>/dev/null)
+          [[ "$_dep_status" == "done" ]] || { _satisfied=false; break; }
+        fi
+      done <<< "$_deps"
+      $_satisfied || continue
+      local _model
+      _model=$(jq -r --arg id "$tid" '.tasks[] | select(.id == $id) | .model' "$TASKS_JSON" 2>/dev/null)
+      wave_tasks+=("$tid|$_model")
+    done
+
+    [[ ${#wave_tasks[@]} -eq 0 ]] && break
+
+    echo ""
+    if (( ${#wave_tasks[@]} > MAX_PARALLEL )); then
+      echo "Wave $wave  (${#wave_tasks[@]} ready, ${MAX_PARALLEL} slots — rest spill to next wave):"
+    else
+      echo "Wave $wave  (${#wave_tasks[@]} in parallel):"
+    fi
+
+    local slot=0
+    for _entry in "${wave_tasks[@]}"; do
+      local tid="${_entry%%|*}" _model="${_entry#*|}"
+      local _dep_list
+      _dep_list=$(jq -r --arg id "$tid" '.tasks[] | select(.id == $id) | .depends_on[]? | "TASK-\(.)"' "$TASKS_JSON" 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+      if (( slot < MAX_PARALLEL )); then
+        echo "  [$tid] ($_model)$( [[ -n "$_dep_list" ]] && echo " ← needs: $_dep_list")"
+      else
+        echo "  [$tid] ($_model) ← spills to wave $((wave+1))"
+      fi
+      vdone_str="$vdone_str $tid"
+      (( total++ )) || true; (( slot++ )) || true
+    done
+    (( wave++ )) || true
+  done
+
+  local _dep_blocked=0
+  for tid in "${_all_ids[@]}"; do
+    echo " $vdone_str " | grep -q " $tid " && continue
+    (( _dep_blocked++ )) || true
+    local _dep_list
+    _dep_list=$(jq -r --arg id "$tid" '.tasks[] | select(.id == $id) | .depends_on[]? | "TASK-\(.)"' "$TASKS_JSON" 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+    echo "  ⛔ [$tid] dep-blocked — needs: ${_dep_list:-none}"
+  done
+
+  echo ""
+  local _blocked_note=""
+  (( _dep_blocked > 0 )) && _blocked_note=", $_dep_blocked dep-blocked"
+  echo "Total: $total tasks across $((wave - 1)) wave(s)${_blocked_note}"
+}
+
 show_dry_run_plan() {
   local vdone_str=""   # space-separated IDs of virtually completed tasks
   local wave=1
@@ -410,6 +560,10 @@ show_dry_run_plan() {
 
   echo "📋 Execution plan (--parallel ${MAX_PARALLEL}):"
   [[ "$STRICT_CONFLICTS" == true ]] && echo "   conflict mode: strict (serialize on file overlap)"
+
+  if [[ "$RELAY_SOURCE" == "issues" ]]; then
+    _issues_dry_run_plan
+  else
 
   while true; do
     # Find all tasks runnable in this wave
@@ -480,6 +634,8 @@ show_dry_run_plan() {
   (( scout_blocked > 0 )) && blocked_note="${blocked_note}, $scout_blocked scout-blocked"
   echo "Total: $total tasks across $((wave - 1)) wave(s)${blocked_note}"
 
+  fi  # end else (TASKS.md mode)
+
   if [[ "$SKIP_STATIC_ANALYSIS" != true ]] && [[ -n "$STATIC_ANALYSIS_TYPECHECK" || -n "$STATIC_ANALYSIS_LINT" || -n "$STATIC_ANALYSIS_FORMAT" ]]; then
     echo ""
     echo "  [STATIC ANALYSIS] (deterministic) ← lint/typecheck/format on changed files"
@@ -503,8 +659,26 @@ show_dry_run_plan() {
 }
 
 if [[ "$DRY_RUN" == true ]]; then
+  # In issues mode, hydrate tasks.json before displaying the plan
+  if [[ "$RELAY_SOURCE" == "issues" && ! -f "$TASKS_JSON" ]]; then
+    _hydrate_bin="${DEVTOOLS_ROOT}/bin/hydrate-tasks"
+    if [[ -x "$_hydrate_bin" ]]; then
+      if [[ -n "$RELAY_MILESTONE" ]]; then
+        "$_hydrate_bin" --milestone "$RELAY_MILESTONE" --output "$TASKS_JSON"
+      else
+        "$_hydrate_bin" --output "$TASKS_JSON"
+        RELAY_MILESTONE=$(jq -r '.relay_label' "$TASKS_JSON" 2>/dev/null || echo "")
+      fi
+    fi
+  elif [[ "$RELAY_SOURCE" == "issues" && -f "$TASKS_JSON" && -z "$RELAY_MILESTONE" ]]; then
+    RELAY_MILESTONE=$(jq -r '.relay_label' "$TASKS_JSON" 2>/dev/null || echo "")
+  fi
   echo "🏁 Parallel Relay Race (DRY RUN)"
-  echo "   parallel: ${MAX_PARALLEL}  |  file: ${TASKS_FILE}"
+  if [[ "$RELAY_SOURCE" == "issues" ]]; then
+    echo "   parallel: ${MAX_PARALLEL}  |  issues: ${RELAY_MILESTONE}  |  file: ${TASKS_JSON}"
+  else
+    echo "   parallel: ${MAX_PARALLEL}  |  file: ${TASKS_FILE}"
+  fi
   echo ""
   show_dry_run_plan
   exit 0
@@ -522,6 +696,14 @@ run_task() {
   prompt=$(load_agent "relay-task-runner")
   prompt="${prompt//\{\{TASK_ID\}\}/${task_id}}"
   prompt="${prompt//\{\{TASK_LINE\}\}/${task_line}}"
+
+  # In issues mode, inject task body into TASK_BODY env var and substitute placeholder
+  if [[ "$RELAY_SOURCE" == "issues" ]]; then
+    local task_body
+    task_body=$(jq -r --arg id "$task_id" '.tasks[] | select(.id == $id) | .body' "$TASKS_JSON" 2>/dev/null)
+    export TASK_BODY="$task_body"
+    prompt="${prompt//\{\{TASK_BODY\}\}/${task_body}}"
+  fi
 
   echo "  🚀 [${task_id}] Starting" | tee "$log"
   duration_log_start
@@ -655,9 +837,13 @@ run_simplify_gate() {
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo ""
 
-  # Compute next SC-N counter (count existing SC-\d+ tasks)
+  # Compute next SC-N counter
   local existing_sc_count
-  existing_sc_count=$(grep -c '^\- \[.\{0,1\}\] \*\*Task SC-[0-9]' "$TASKS_FILE" 2>/dev/null || echo 0)
+  if [[ "$RELAY_SOURCE" == "issues" ]]; then
+    existing_sc_count=$(jq '[.tasks[] | select(.id | startswith("SC-"))] | length' "$TASKS_JSON" 2>/dev/null || echo 0)
+  else
+    existing_sc_count=$(grep -c '^\- \[.\{0,1\}\] \*\*Task SC-[0-9]' "$TASKS_FILE" 2>/dev/null || echo 0)
+  fi
   local next_sc=$(( existing_sc_count + 1 ))
   local next_sc2=$(( existing_sc_count + 2 ))
 
@@ -702,7 +888,11 @@ run_hygiene_gate() {
 
   # Compute next HG-N counter
   local existing_hg_count
-  existing_hg_count=$(grep -c '^\- \[.\{0,1\}\] \*\*Task HG-[0-9]' "$TASKS_FILE" 2>/dev/null || echo 0)
+  if [[ "$RELAY_SOURCE" == "issues" ]]; then
+    existing_hg_count=$(jq '[.tasks[] | select(.id | startswith("HG-"))] | length' "$TASKS_JSON" 2>/dev/null || echo 0)
+  else
+    existing_hg_count=$(grep -c '^\- \[.\{0,1\}\] \*\*Task HG-[0-9]' "$TASKS_FILE" 2>/dev/null || echo 0)
+  fi
   existing_hg_count=${existing_hg_count//[^0-9]/}
   local next_hg=$(( existing_hg_count + 1 ))
 
@@ -942,6 +1132,9 @@ init_relay_state() {
     --arg branch "${RELAY_BRANCH:-}" \
     --arg base "$RELAY_BASE_SHA" \
     --arg tasks "$TASKS_FILE" \
+    --arg source "$RELAY_SOURCE" \
+    --arg milestone "$RELAY_MILESTONE" \
+    --arg tasks_json "$TASKS_JSON" \
     --argjson parallel "${MAX_PARALLEL:-1}" \
     --argjson pr_mode "$(if [[ "$PR_MODE" == true ]]; then echo true; else echo false; fi)" \
     --argjson skip_review "$(if [[ "$SKIP_REVIEW_GATE" == true ]]; then echo true; else echo false; fi)" \
@@ -950,7 +1143,7 @@ init_relay_state() {
     --argjson skip_hygiene "$(if [[ "$SKIP_HYGIENE_GATE" == true ]]; then echo true; else echo false; fi)" \
     --argjson skip_critique "$(if [[ "$SKIP_CRITIQUE_GATE" == true ]]; then echo true; else echo false; fi)" \
     --argjson skip_security "$(if [[ "$SKIP_SECURITY_REVIEWER" == true ]]; then echo true; else echo false; fi)" \
-    '{started_at:$t, relay_branch:$branch, relay_base_sha:$base, tasks_file:$tasks, parallel:$parallel, pr_mode:$pr_mode, skip_flags:{review:$skip_review,browser:$skip_browser,static_analysis:$skip_static,hygiene:$skip_hygiene,critique:$skip_critique,security:$skip_security}, completed_tasks:[], failed_tasks:[], current_phase:"tasks", gates_completed:[]}' \
+    '{started_at:$t, relay_branch:$branch, relay_base_sha:$base, tasks_file:$tasks, source:$source, relay_milestone:$milestone, tasks_json:$tasks_json, parallel:$parallel, pr_mode:$pr_mode, skip_flags:{review:$skip_review,browser:$skip_browser,static_analysis:$skip_static,hygiene:$skip_hygiene,critique:$skip_critique,security:$skip_security}, completed_tasks:[], failed_tasks:[], current_phase:"tasks", gates_completed:[]}' \
     > "$RELAY_STATE_FILE"
 }
 
@@ -992,6 +1185,27 @@ load_resume_state() {
   if [[ "$TASKS_FILE" == "${RELAY_TASKS_FILE}" ]]; then
     # Not overridden by CLI — use state file's value
     TASKS_FILE="$state_tasks"
+  fi
+
+  # Restore issues mode settings from state
+  local state_source; state_source=$(jq -r '.source // "tasks_file"' "$state_file")
+  local state_milestone; state_milestone=$(jq -r '.relay_milestone // ""' "$state_file")
+  local state_tasks_json; state_tasks_json=$(jq -r '.tasks_json // ".relay-tasks.json"' "$state_file")
+  if [[ "$RELAY_SOURCE" == "tasks_file" ]]; then
+    RELAY_SOURCE="$state_source"
+  fi
+  [[ -z "$RELAY_MILESTONE" ]] && RELAY_MILESTONE="$state_milestone"
+  [[ "$TASKS_JSON" == ".relay-tasks.json" ]] && TASKS_JSON="$state_tasks_json"
+
+  # In issues mode, re-hydrate tasks.json if missing
+  if [[ "$RELAY_SOURCE" == "issues" && ! -f "$TASKS_JSON" ]]; then
+    info "tasks.json missing — re-hydrating from milestone $RELAY_MILESTONE..."
+    local hydrate_bin="${DEVTOOLS_ROOT}/bin/hydrate-tasks"
+    if [[ -x "$hydrate_bin" ]]; then
+      "$hydrate_bin" --milestone "$RELAY_MILESTONE" --output "$TASKS_JSON"
+    else
+      die "Cannot re-hydrate: hydrate-tasks not found at $hydrate_bin"
+    fi
   fi
 
   # Restore run config flags from state
@@ -1170,6 +1384,31 @@ if [[ "$RESUME_MODE" == true ]]; then
   load_resume_state
   duration_log_init "$LOCK_DIR/duration-report.jsonl"  # after load_resume_state so existing log is preserved
 else
+  # ── Issues mode: auto-hydrate tasks.json if needed ────────────────────────
+  if [[ "$RELAY_SOURCE" == "issues" ]]; then
+    if [[ ! -f "$TASKS_JSON" ]]; then
+      echo "⚡ Issues mode: hydrating tasks.json from GitHub Issues..."
+      hydrate_bin="${DEVTOOLS_ROOT}/bin/hydrate-tasks"
+      if [[ ! -x "$hydrate_bin" ]]; then
+        echo "Error: hydrate-tasks not found at $hydrate_bin" >&2
+        exit 1
+      fi
+      if [[ -n "$RELAY_MILESTONE" ]]; then
+        "$hydrate_bin" --milestone "$RELAY_MILESTONE" --output "$TASKS_JSON"
+      else
+        "$hydrate_bin" --output "$TASKS_JSON"
+        # Read back the generated milestone name
+        RELAY_MILESTONE=$(jq -r '.relay_label' "$TASKS_JSON" 2>/dev/null || echo "")
+      fi
+    else
+      # tasks.json exists — read milestone name from it
+      if [[ -z "$RELAY_MILESTONE" ]]; then
+        RELAY_MILESTONE=$(jq -r '.relay_label' "$TASKS_JSON" 2>/dev/null || echo "")
+      fi
+    fi
+    export RELAY_SOURCE RELAY_MILESTONE TASKS_JSON
+  fi
+
   RELAY_BASE_SHA=$(git rev-parse HEAD)   # snapshot before any relay commits
 
   # ── Initialize cost tracking ───────────────────────────────────────────────
@@ -1203,7 +1442,12 @@ else
 fi
 
 echo "🏁 Parallel Relay Race"
-echo "   parallel: ${MAX_PARALLEL}  |  file: ${TASKS_FILE}"
+if [[ "$RELAY_SOURCE" == "issues" ]]; then
+  echo "   parallel: ${MAX_PARALLEL}  |  source: GitHub Issues  |  milestone: ${RELAY_MILESTONE:-auto}"
+  echo "   tasks.json: ${TASKS_JSON}"
+else
+  echo "   parallel: ${MAX_PARALLEL}  |  file: ${TASKS_FILE}"
+fi
 [[ "$USE_GEMINI" == true ]] && echo "   agent: Gemini → Claude fallback" \
                              || echo "   agent: Claude"
 echo ""
@@ -1276,7 +1520,11 @@ while true; do
   local_running=$(_map_size)
 
   # ── Check for completion ───────────────────────────────────────────────────
-  local_remaining=$(grep -c '^\- \[ \]' "$TASKS_FILE" 2>/dev/null) || local_remaining=0
+  if [[ "$RELAY_SOURCE" == "issues" ]]; then
+    local_remaining=$(jq '[.tasks[] | select(.status == "pending")] | length' "$TASKS_JSON" 2>/dev/null) || local_remaining=0
+  else
+    local_remaining=$(grep -c '^\- \[ \]' "$TASKS_FILE" 2>/dev/null) || local_remaining=0
+  fi
   if (( local_remaining == 0 && local_running == 0 )); then
     if (( ${#pending_gate_pids[@]} > 0 )); then
       echo "⏳ Waiting for quality gates to finish..."
@@ -1285,18 +1533,30 @@ while true; do
       done
       pending_gate_pids=()
       # Re-check: a gate may have added SC-* tasks
-      local_remaining=$(grep -c '^\- \[ \]' "$TASKS_FILE" 2>/dev/null) || local_remaining=0
+      if [[ "$RELAY_SOURCE" == "issues" ]]; then
+        local_remaining=$(jq '[.tasks[] | select(.status == "pending")] | length' "$TASKS_JSON" 2>/dev/null) || local_remaining=0
+      else
+        local_remaining=$(grep -c '^\- \[ \]' "$TASKS_FILE" 2>/dev/null) || local_remaining=0
+      fi
       [[ $local_remaining -gt 0 ]] && continue
     fi
     # Check for any scout-blocked tasks before declaring victory
-    local_scout_blocked=$(grep -c '^\- \[B\]' "$TASKS_FILE" 2>/dev/null) || local_scout_blocked=0
+    if [[ "$RELAY_SOURCE" == "issues" ]]; then
+      local_scout_blocked=$(jq '[.tasks[] | select(.status == "blocked")] | length' "$TASKS_JSON" 2>/dev/null) || local_scout_blocked=0
+    else
+      local_scout_blocked=$(grep -c '^\- \[B\]' "$TASKS_FILE" 2>/dev/null) || local_scout_blocked=0
+    fi
     echo ""
     if (( local_scout_blocked > 0 )); then
       echo "⚠️  Tasks complete, but $local_scout_blocked task(s) are scout-blocked (need human decisions):"
-      grep '^\- \[B\]' "$TASKS_FILE" | while IFS= read -r bline; do
-        btid=$(task_id_of "$bline")
-        echo "   🛑 [$btid] — see task body in ${TASKS_FILE} for the decision needed"
-      done
+      if [[ "$RELAY_SOURCE" == "issues" ]]; then
+        jq -r '.tasks[] | select(.status == "blocked") | "   🛑 [" + .id + "] — see GitHub Issue #" + (.issue | tostring) + " for the decision needed"' "$TASKS_JSON"
+      else
+        grep '^\- \[B\]' "$TASKS_FILE" | while IFS= read -r bline; do
+          btid=$(task_id_of "$bline")
+          echo "   🛑 [$btid] — see task body in ${TASKS_FILE} for the decision needed"
+        done
+      fi
       if [[ -f "$LOCK_DIR/BLOCKED-SUMMARY.txt" ]]; then
         echo ""
         echo "   Full decision log: $LOCK_DIR/BLOCKED-SUMMARY.txt"
@@ -1313,21 +1573,41 @@ while true; do
     next_id=""
     next_line=""
 
-    while IFS= read -r line; do
-      [[ "$line" =~ ^\-\ \[\ \] ]] || continue
-      tid=$(task_id_of "$line")
-      [[ -z "$tid" ]] && continue
-      is_claimed "$tid" && continue
-      is_task_done "$tid" && continue
-      deps_satisfied "$line" || continue
-      next_id="$tid"
-      next_line="$line"
-      break
-    done < "$TASKS_FILE"
+    if [[ "$RELAY_SOURCE" == "issues" ]]; then
+      # Issues mode: iterate tasks from tasks.json
+      while IFS= read -r task_id; do
+        [[ -z "$task_id" ]] && continue
+        is_claimed "$task_id" && continue
+        is_task_done "$task_id" && continue
+        # Skip non-pending tasks
+        task_status=$(jq -r --arg id "$task_id" '.tasks[] | select(.id == $id) | .status' "$TASKS_JSON" 2>/dev/null)
+        [[ "$task_status" != "pending" ]] && continue
+        # Check dependencies
+        issues_deps_satisfied "$task_id" || continue
+        next_id="$task_id"
+        # Synthesize a task line for compat with existing functions
+        task_model=$(jq -r --arg id "$task_id" '.tasks[] | select(.id == $id) | .model' "$TASKS_JSON" 2>/dev/null)
+        task_title=$(jq -r --arg id "$task_id" '.tasks[] | select(.id == $id) | .title' "$TASKS_JSON" 2>/dev/null)
+        next_line="- [ ] **Task ${task_id}: [${task_model}] ${task_title}**"
+        break
+      done < <(jq -r '.tasks[].id' "$TASKS_JSON" 2>/dev/null)
+    else
+      while IFS= read -r line; do
+        [[ "$line" =~ ^\-\ \[\ \] ]] || continue
+        tid=$(task_id_of "$line")
+        [[ -z "$tid" ]] && continue
+        is_claimed "$tid" && continue
+        is_task_done "$tid" && continue
+        deps_satisfied "$line" || continue
+        next_id="$tid"
+        next_line="$line"
+        break
+      done < "$TASKS_FILE"
+    fi
 
     [[ -z "$next_id" ]] && break  # Nothing runnable right now
 
-    # Guard: if agent completed but relay crashed before updating TASKS.md, skip re-run
+    # Guard: if agent completed but relay crashed before updating task store, skip re-run
     if [[ -f "$LOCK_DIR/done-$next_id" ]]; then
       echo "  ⏭️  [${next_id}] Already done (done-file exists) — marking complete"
       mark_done "$next_id" "$(head -1 "$LOCK_DIR/done-$next_id")"
@@ -1377,31 +1657,63 @@ while true; do
   if (( local_running == 0 && local_remaining > 0 )); then
     # Classify remaining tasks: scout-blocked-dep stall vs real circular deadlock
     real_deadlock=false
-    while IFS= read -r line; do
-      [[ "$line" =~ ^\-\ \[\ \] ]] || continue
-      tid=$(task_id_of "$line")
-      deps_str=$(deps_of "$line" | tr '\n' ' ')
-      # Check if every unsatisfied dep is [B] (blocked) — if so, not a real deadlock
-      has_blocked_dep=false
-      has_unblocked_dep=false
-      for dep in $(deps_of "$line"); do
-        if grep -q "^\- \[B\].*Task[[:space:]]*${dep}" "$TASKS_FILE" 2>/dev/null; then
-          has_blocked_dep=true
-        elif ! grep -q "^\- \[x\].*Task[[:space:]]*${dep}" "$TASKS_FILE" 2>/dev/null; then
-          has_unblocked_dep=true
+
+    if [[ "$RELAY_SOURCE" == "issues" ]]; then
+      # Issues mode: check tasks.json for dep satisfaction
+      while IFS= read -r tid; do
+        [[ -z "$tid" ]] && continue
+        task_status_dl=$(jq -r --arg id "$tid" '.tasks[] | select(.id == $id) | .status' "$TASKS_JSON" 2>/dev/null)
+        [[ "$task_status_dl" != "pending" ]] && continue
+        # Check each dep
+        has_blocked_dep=false
+        has_unblocked_dep=false
+        while IFS= read -r dep_num; do
+          [[ -z "$dep_num" ]] && continue
+          dep_id="TASK-${dep_num}"
+          dep_status_dl=$(jq -r --arg id "$dep_id" '.tasks[] | select(.id == $id) | .status' "$TASKS_JSON" 2>/dev/null)
+          if [[ "$dep_status_dl" == "blocked" ]]; then
+            has_blocked_dep=true
+          elif [[ "$dep_status_dl" != "done" ]]; then
+            has_unblocked_dep=true
+          fi
+        done < <(jq -r --arg id "$tid" '.tasks[] | select(.id == $id) | .depends_on[]?' "$TASKS_JSON" 2>/dev/null)
+        if [[ "$has_unblocked_dep" == true ]]; then
+          real_deadlock=true
+          echo "  ⛔ [$tid] circular/missing dep"
+        elif [[ "$has_blocked_dep" == true ]]; then
+          echo "  ⏸️  [$tid] waiting on scout-blocked dep"
+        else
+          real_deadlock=true
+          echo "  ⛔ [$tid] unresolvable"
         fi
-      done
-      if [[ "$has_unblocked_dep" == true ]]; then
-        real_deadlock=true
-        echo "  ⛔ [$tid] circular/missing dep — needs: ${deps_str:-none}"
-      elif [[ "$has_blocked_dep" == true ]]; then
-        echo "  ⏸️  [$tid] waiting on scout-blocked dep — needs: ${deps_str:-none}"
-      else
-        # No unsatisfied deps but still [ ] — shouldn't happen, treat as deadlock
-        real_deadlock=true
-        echo "  ⛔ [$tid] unresolvable — needs: ${deps_str:-none}"
-      fi
-    done < "$TASKS_FILE"
+      done < <(jq -r '.tasks[].id' "$TASKS_JSON" 2>/dev/null)
+    else
+      while IFS= read -r line; do
+        [[ "$line" =~ ^\-\ \[\ \] ]] || continue
+        tid=$(task_id_of "$line")
+        deps_str=$(deps_of "$line" | tr '\n' ' ')
+        # Check if every unsatisfied dep is [B] (blocked) — if so, not a real deadlock
+        has_blocked_dep=false
+        has_unblocked_dep=false
+        for dep in $(deps_of "$line"); do
+          if grep -q "^\- \[B\].*Task[[:space:]]*${dep}" "$TASKS_FILE" 2>/dev/null; then
+            has_blocked_dep=true
+          elif ! grep -q "^\- \[x\].*Task[[:space:]]*${dep}" "$TASKS_FILE" 2>/dev/null; then
+            has_unblocked_dep=true
+          fi
+        done
+        if [[ "$has_unblocked_dep" == true ]]; then
+          real_deadlock=true
+          echo "  ⛔ [$tid] circular/missing dep — needs: ${deps_str:-none}"
+        elif [[ "$has_blocked_dep" == true ]]; then
+          echo "  ⏸️  [$tid] waiting on scout-blocked dep — needs: ${deps_str:-none}"
+        else
+          # No unsatisfied deps but still [ ] — shouldn't happen, treat as deadlock
+          real_deadlock=true
+          echo "  ⛔ [$tid] unresolvable — needs: ${deps_str:-none}"
+        fi
+      done < "$TASKS_FILE"
+    fi
 
     if [[ "$real_deadlock" == true ]]; then
       echo ""
@@ -1410,7 +1722,11 @@ while true; do
     else
       echo ""
       echo "⏸️  $local_remaining task(s) are waiting on scout-blocked dependencies."
-      echo "   Resolve the 🛑 BLOCKED tasks in ${TASKS_FILE}, reset them to [ ], then re-run."
+      if [[ "$RELAY_SOURCE" == "issues" ]]; then
+        echo "   Resolve the 🛑 BLOCKED tasks in GitHub Issues, then re-run."
+      else
+        echo "   Resolve the 🛑 BLOCKED tasks in ${TASKS_FILE}, reset them to [ ], then re-run."
+      fi
     fi
     break
   fi
@@ -1550,7 +1866,11 @@ if [[ "$PR_MODE" == true ]]; then
   # Build PR body with gate result aggregation (wrapped in a function so local is valid)
   build_pr_body() {
     local task_count
-    task_count=$(grep -c '^\- \[x\]' "$TASKS_FILE" 2>/dev/null || echo "0")
+    if [[ "$RELAY_SOURCE" == "issues" ]]; then
+      task_count=$(jq '[.tasks[] | select(.status == "done")] | length' "$TASKS_JSON" 2>/dev/null || echo "0")
+    else
+      task_count=$(grep -c '^\- \[x\]' "$TASKS_FILE" 2>/dev/null || echo "0")
+    fi
 
     # Collect gate results from done-files
     _gate_status() {
@@ -1629,7 +1949,11 @@ Generated with [Claude Code](https://claude.com/claude-code) relay-race"
     echo "$body"
   }
 
-  TASK_COUNT=$(grep -c '^\- \[x\]' "$TASKS_FILE" 2>/dev/null || echo "0")
+  if [[ "$RELAY_SOURCE" == "issues" ]]; then
+    TASK_COUNT=$(jq '[.tasks[] | select(.status == "done")] | length' "$TASKS_JSON" 2>/dev/null || echo "0")
+  else
+    TASK_COUNT=$(grep -c '^\- \[x\]' "$TASKS_FILE" 2>/dev/null || echo "0")
+  fi
   PR_BODY=$(build_pr_body)
 
   PR_URL=$(gh pr create --title "relay: $(date +%Y-%m-%d) — $TASK_COUNT tasks" --body "$PR_BODY" --base main)

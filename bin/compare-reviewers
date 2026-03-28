@@ -1,0 +1,575 @@
+#!/usr/bin/env bash
+# compare-reviewers — Multi-model PR review comparison experiment
+#
+# Runs a PR through multiple AI models across correctness, security, and
+# complexity prompts. Uses existing Claude reviews as baseline. Outputs
+# a structured comparison report.
+#
+# Usage:
+#   devtools compare-reviewers 42
+#   devtools compare-reviewers 42 43 44 45 46
+#   devtools compare-reviewers --prompt all 42          # run all prompt types
+#   devtools compare-reviewers --output results.json 42
+#
+# Models tested:
+#   Claude  Sonnet (baseline, via claude CLI subscription)
+#   Gemini  gemini-2.5-flash, gemini-3.1-pro-preview   (GOOGLE_API_KEY)
+#   OpenAI  gpt-4.1, gpt-5.4-2026-03-05               (OPENAI_API_KEY)
+#
+# Notes:
+#   - Gemini excels at large context — no truncation applied
+#   - OpenAI Codex models optimized for code reasoning
+#   - gpt-5.4 uses max_completion_tokens (newer API convention)
+
+set -eo pipefail
+
+LIB_DIR="$(cd "$(dirname "$0")/../lib" && pwd)"
+source "${LIB_DIR}/config.sh"
+source "${LIB_DIR}/helpers.sh"
+source "${LIB_DIR}/agents.sh"
+
+cd "$REPO_ROOT"
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+
+PROMPT_TYPES="correctness"   # correctness | security | complexity | all
+OUTPUT_FILE=""
+MAX_CONTEXT_BYTES="${MAX_CONTEXT_BYTES:-600000}"
+GEMINI_FULL_CONTEXT="${GEMINI_FULL_CONTEXT:-false}"  # skip truncation for Gemini
+
+# Models to test per provider (comma-separated)
+GEMINI_MODELS="${GEMINI_MODELS:-gemini-2.5-flash,gemini-3.1-pro-preview}"
+OPENAI_MODELS="${OPENAI_MODELS:-gpt-4.1,gpt-5.4-2026-03-05}"
+
+# ── Shared review output format ───────────────────────────────────────────────
+
+OUTPUT_FORMAT='Output ONLY valid JSON (no markdown fencing):
+{
+  "summary": "1-2 sentence overall assessment",
+  "issues": [
+    {
+      "file": "src/path/to/file.ts",
+      "line": 42,
+      "severity": "critical|warning|info",
+      "message": "What is wrong and how to fix it"
+    }
+  ],
+  "review_effort": 3,
+  "verdict": "approve|request_changes|comment"
+}
+If no issues: {"summary":"...","issues":[],"review_effort":N,"verdict":"approve"}.'
+
+# ── Build review context ──────────────────────────────────────────────────────
+
+build_context() {
+  local pr="$1"
+  local unlimited="${2:-false}"  # if true, skip byte-cap truncation
+  local context_file
+  context_file=$(mktemp)
+  TEMP_FILES+=("$context_file")
+
+  local pr_json
+  pr_json=$(gh pr view "$pr" --json title,body,headRefName,baseRefName,files)
+  local title body head_branch
+  title=$(printf '%s' "$pr_json" | jq -r '.title')
+  body=$(printf '%s' "$pr_json" | jq -r '.body // "No description"')
+  head_branch=$(printf '%s' "$pr_json" | jq -r '.headRefName')
+
+  printf '# PR #%s: %s\n\n## Description\n%s\n\n## Branch\n%s\n\n' \
+    "$pr" "$title" "$body" "$head_branch" > "$context_file"
+  printf '## Diff\n' >> "$context_file"
+  gh pr diff "$pr" --patch >> "$context_file" 2>/dev/null || true
+  printf '\n## Changed Files\n' >> "$context_file"
+
+  local files_json
+  files_json=$(printf '%s' "$pr_json" | jq -c '.files[] | {path: .path, status: .status, additions: (.additions // 0), deletions: (.deletions // 0)}')
+  local sorted_files
+  sorted_files=$(printf '%s\n' "$files_json" | jq -sc 'sort_by(-(.additions + .deletions))[]' 2>/dev/null) || sorted_files="$files_json"
+
+  local content_budget
+  if [[ "$unlimited" == "true" ]]; then
+    content_budget=99999999
+  else
+    content_budget=$(( MAX_CONTEXT_BYTES / 2 ))
+  fi
+  local content_used=0
+
+  while IFS= read -r file_entry; do
+    [[ -z "$file_entry" ]] && continue
+    local file status
+    file=$(printf '%s' "$file_entry" | jq -r '.path')
+    status=$(printf '%s' "$file_entry" | jq -r '.status')
+    [[ "$status" == "removed" ]] && continue
+    local content
+    content=$(gh api "repos/{owner}/{repo}/contents/${file}?ref=${head_branch}" \
+      --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || echo "[binary or too large]")
+    local file_size=${#content}
+    if [[ $(( content_used + file_size )) -gt $content_budget && $content_used -gt 0 ]]; then
+      printf '\n### %s (diff-only — budget exceeded)\n' "$file" >> "$context_file"
+      continue
+    fi
+    printf '\n### %s\n```\n%s\n```\n' "$file" "$content" >> "$context_file"
+    content_used=$(( content_used + file_size ))
+  done <<< "$sorted_files"
+
+  if [[ -f "$REPO_ROOT/$REVIEW_RULES_FILE" ]]; then
+    printf '\n## Project Rules\n' >> "$context_file"
+    head -${REVIEW_RULES_MAX_LINES} "$REPO_ROOT/$REVIEW_RULES_FILE" >> "$context_file"
+  fi
+
+  echo "$context_file"
+}
+
+# ── Fetch existing Claude reviews from GitHub as baseline ────────────────────
+
+fetch_baseline() {
+  local pr="$1"
+  # Pull review bodies from the PR (skip the devtools-reviewed markers and approve-only reviews)
+  gh api "repos/{owner}/{repo}/pulls/${pr}/reviews" \
+    --jq '[.[] | select((.body | length > 150) and (.body | startswith("<!-- devtools") | not)) | {reviewer: .user.login, state: .state, body: .body}]' \
+    2>/dev/null || echo "[]"
+}
+
+# ── Extract issues mentioned in baseline reviews ─────────────────────────────
+
+extract_baseline_issues() {
+  local baseline_json="$1"
+  # Extract file:line patterns from review text
+  printf '%s' "$baseline_json" | python3 -c "
+import sys, json, re
+reviews = json.load(sys.stdin)
+files_flagged = set()
+for r in reviews:
+    body = r.get('body', '')
+    # Look for backtick file references like \`src/lib/foo.ts:42\`
+    matches = re.findall(r'\`([a-zA-Z0-9_./@-]+\.[a-z]+)(?::(\d+))?\`', body)
+    for m in matches:
+        files_flagged.add(m[0])
+print(json.dumps(sorted(files_flagged)))
+" 2>/dev/null || echo "[]"
+}
+
+# ── Call a single model ───────────────────────────────────────────────────────
+
+call_model() {
+  local provider="$1"  # claude | gemini | openai
+  local model="$2"
+  local prompt_file="$3"
+  local out_file="$4"
+  local err_file="$5"
+
+  local start_time
+  start_time=$(date +%s%3N 2>/dev/null || python3 -c "import time; print(int(time.time()*1000))")
+
+  local raw_output
+  if [[ "$provider" == "gemini" || "$provider" == "openai" ]]; then
+    raw_output=$(python3 "${DEVTOOLS_ROOT}/lib/call-model.py" \
+      --provider "$provider" \
+      --model "$model" \
+      < "$prompt_file" \
+      2>"$err_file") || {
+        echo "{\"summary\":\"[API call failed]\",\"issues\":[],\"review_effort\":0,\"verdict\":\"comment\",\"_error\":true}" > "$out_file"
+        return 1
+      }
+  else
+    raw_output=$(env -u CLAUDECODE claude -p - \
+      --model "$model" \
+      --output-format text \
+      --max-turns 2 \
+      < "$prompt_file" \
+      2>"$err_file") || {
+        echo "{\"summary\":\"[API call failed]\",\"issues\":[],\"review_effort\":0,\"verdict\":\"comment\",\"_error\":true}" > "$out_file"
+        return 1
+      }
+  fi
+
+  local end_time elapsed_ms
+  end_time=$(date +%s%3N 2>/dev/null || python3 -c "import time; print(int(time.time()*1000))")
+  elapsed_ms=$(( end_time - start_time ))
+
+  # Parse JSON (strip markdown fences first)
+  local parsed
+  parsed=$(printf '%s' "$raw_output" | python3 -c "
+import sys, json
+
+raw = sys.stdin.read().strip()
+# Strip markdown fences
+lines = raw.split('\n')
+if lines and lines[0].startswith('\`\`\`'):
+    lines = lines[1:]
+if lines and lines[-1].strip() == '\`\`\`':
+    lines = lines[:-1]
+raw = '\n'.join(lines).strip()
+
+# Find JSON object boundaries
+start = raw.find('{')
+end = raw.rfind('}')
+if start == -1 or end == -1:
+    obj = {'summary': '[parse failed]', 'issues': [], 'review_effort': 0, 'verdict': 'comment', '_parse_failed': True}
+else:
+    try:
+        obj = json.loads(raw[start:end+1])
+    except:
+        obj = {'summary': '[parse failed]', 'issues': [], 'review_effort': 0, 'verdict': 'comment', '_parse_failed': True}
+
+obj['_elapsed_ms'] = $elapsed_ms
+obj['_model'] = '$(printf '%s' "$model" | tr "'" "_")'
+obj['_provider'] = '$provider'
+print(json.dumps(obj))
+" 2>/dev/null)
+
+  if [[ -z "$parsed" ]]; then
+    printf '{"summary":"[internal error]","issues":[],"review_effort":0,"verdict":"comment","_elapsed_ms":%d,"_model":"%s","_provider":"%s"}' \
+      "$elapsed_ms" "$model" "$provider" > "$out_file"
+  else
+    printf '%s' "$parsed" > "$out_file"
+  fi
+}
+
+# ── Run one prompt type across all models ────────────────────────────────────
+
+run_prompt_type() {
+  local pr="$1"
+  local prompt_type="$2"   # correctness | security | complexity
+  local context_file="$3"
+  local gemini_context_file="$4"  # larger context for Gemini
+
+  # Load the appropriate agent prompt
+  local agent_id prompt
+  case "$prompt_type" in
+    correctness) agent_id="review-correctness" ;;
+    security)    agent_id="review-security" ;;
+    complexity)  agent_id="review-complexity" ;;
+    *) err "Unknown prompt type: $prompt_type"; return 1 ;;
+  esac
+  prompt="$(load_agent "$agent_id")
+
+${OUTPUT_FORMAT}"
+
+  # Build prompt files
+  local std_prompt_file gemini_prompt_file
+  std_prompt_file=$(mktemp)
+  gemini_prompt_file=$(mktemp)
+  TEMP_FILES+=("$std_prompt_file" "$gemini_prompt_file")
+  printf '%s\n\n' "$prompt" > "$std_prompt_file"
+  cat "$context_file" >> "$std_prompt_file"
+  printf '%s\n\n' "$prompt" > "$gemini_prompt_file"
+  cat "$gemini_context_file" >> "$gemini_prompt_file"
+
+  local std_kb gemini_kb
+  std_kb=$(( $(wc -c < "$std_prompt_file" | tr -d ' ') / 1024 ))
+  gemini_kb=$(( $(wc -c < "$gemini_prompt_file" | tr -d ' ') / 1024 ))
+
+  info "  Prompt: ${prompt_type} | std context: ${std_kb}KB | gemini context: ${gemini_kb}KB"
+
+  # Collect all model configs: "provider:model"
+  local configs=()
+  configs+=("claude:sonnet")
+  IFS=',' read -ra _gemini <<< "$GEMINI_MODELS"
+  for m in "${_gemini[@]}"; do
+    configs+=("gemini:${m}")
+  done
+  IFS=',' read -ra _openai <<< "$OPENAI_MODELS"
+  for m in "${_openai[@]}"; do
+    configs+=("openai:${m}")
+  done
+
+  # Run all configs in parallel
+  declare -A out_files err_files prompt_types_used
+  local pids=()
+  for config in "${configs[@]}"; do
+    local provider model
+    provider="${config%%:*}"
+    model="${config#*:}"
+
+    local use_gemini_ctx="false"
+    [[ "$provider" == "gemini" && "$GEMINI_FULL_CONTEXT" == "true" ]] && use_gemini_ctx="true"
+
+    local pf="$std_prompt_file"
+    [[ "$use_gemini_ctx" == "true" ]] && pf="$gemini_prompt_file"
+
+    local out_file err_file
+    out_file=$(mktemp)
+    err_file=$(mktemp)
+    TEMP_FILES+=("$out_file" "$err_file")
+    out_files["${config}"]="$out_file"
+    err_files["${config}"]="$err_file"
+    prompt_types_used["${config}"]="$prompt_type"
+
+    call_model "$provider" "$model" "$pf" "$out_file" "$err_file" &
+    pids+=($!)
+  done
+
+  for pid in "${pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+
+  # Collect results
+  local all_results=()
+  for config in "${configs[@]}"; do
+    local out_file="${out_files[$config]:-}"
+    [[ -z "$out_file" || ! -f "$out_file" ]] && continue
+    local result
+    result=$(cat "$out_file")
+    all_results+=("$result")
+    printf '%s' "$result"
+    echo "---RESULT---${config}"
+  done
+}
+
+# ── Overlap analysis ──────────────────────────────────────────────────────────
+
+analyze_overlap() {
+  local results_json="$1"  # JSON array of {config, result} pairs
+  python3 - << 'PYEOF'
+import sys, json
+
+data = json.load(sys.stdin)
+
+# Collect all flagged files per model
+model_files = {}
+for entry in data:
+    config = entry['config']
+    result = entry['result']
+    files = set()
+    for issue in result.get('issues', []):
+        f = issue.get('file', '')
+        if f:
+            files.add(f)
+    model_files[config] = files
+
+if not model_files:
+    print("No data to analyze.")
+    sys.exit(0)
+
+all_files = set()
+for files in model_files.values():
+    all_files |= files
+
+print(f"\n### File-Level Overlap ({len(all_files)} unique files flagged)\n")
+
+models = sorted(model_files.keys())
+header = f"{'File':<50}" + "".join(f" {m.split(':')[1][:12]:<14}" for m in models)
+print(header)
+print("-" * len(header))
+
+for f in sorted(all_files):
+    row = f"{f:<50}"
+    for m in models:
+        row += " ✓             " if f in model_files[m] else " ✗             "
+    print(row[:len(header)])
+
+print()
+
+# Unique issues (only found by one model)
+for m in models:
+    unique = model_files[m] - set().union(*(model_files[o] for o in models if o != m))
+    if unique:
+        print(f"Unique to {m}:")
+        for f in sorted(unique):
+            print(f"  - {f}")
+PYEOF
+}
+
+# ── Compare a single PR ───────────────────────────────────────────────────────
+
+compare_pr() {
+  local pr="$1"
+
+  echo ""
+  echo "## PR #${pr}"
+  echo ""
+
+  # Fetch baseline
+  local baseline_json
+  baseline_json=$(fetch_baseline "$pr")
+  local baseline_count
+  baseline_count=$(printf '%s' "$baseline_json" | jq 'length' 2>/dev/null || echo 0)
+
+  if [[ "$baseline_count" -gt 0 ]]; then
+    echo "### Baseline (existing Claude reviews: ${baseline_count})"
+    printf '%s' "$baseline_json" | jq -r '.[] | "- **\(.state)** by \(.reviewer): \(.body[:200])..."' 2>/dev/null | head -20
+    echo ""
+  fi
+
+  # Build contexts
+  local context_file gemini_context_file
+  context_file=$(build_context "$pr" "false")
+  if [[ "$GEMINI_FULL_CONTEXT" == "true" ]]; then
+    gemini_context_file=$(build_context "$pr" "true")
+  else
+    gemini_context_file="$context_file"
+  fi
+  local ctx_kb
+  ctx_kb=$(( $(wc -c < "$context_file" | tr -d ' ') / 1024 ))
+  info "PR #${pr}: context ${ctx_kb}KB"
+
+  # Determine prompt types to run
+  local prompt_types=()
+  if [[ "$PROMPT_TYPES" == "all" ]]; then
+    prompt_types=("correctness" "security" "complexity")
+  else
+    IFS=',' read -ra prompt_types <<< "$PROMPT_TYPES"
+  fi
+
+  # Run each prompt type and collect all results
+  local all_results_json="[]"
+  for ptype in "${prompt_types[@]}"; do
+    echo "### Prompt: ${ptype}"
+    echo ""
+
+    # Collect configs
+    local configs=("claude:sonnet")
+    IFS=',' read -ra _gemini <<< "$GEMINI_MODELS"
+    for m in "${_gemini[@]}"; do configs+=("gemini:${m}"); done
+    IFS=',' read -ra _openai <<< "$OPENAI_MODELS"
+    for m in "${_openai[@]}"; do configs+=("openai:${m}"); done
+
+    # Load prompt
+    local agent_id
+    case "$ptype" in
+      correctness) agent_id="review-correctness" ;;
+      security)    agent_id="review-security" ;;
+      complexity)  agent_id="review-complexity" ;;
+    esac
+    local prompt
+    prompt="$(load_agent "$agent_id")
+
+${OUTPUT_FORMAT}"
+
+    # Run all models in parallel
+    declare -A _out _err
+    local _pids=()
+    for config in "${configs[@]}"; do
+      local provider model pf
+      provider="${config%%:*}"
+      model="${config#*:}"
+      pf="$context_file"
+      [[ "$provider" == "gemini" && "$GEMINI_FULL_CONTEXT" == "true" ]] && pf="$gemini_context_file"
+
+      local prompt_file
+      prompt_file=$(mktemp)
+      TEMP_FILES+=("$prompt_file")
+      printf '%s\n\n' "$prompt" > "$prompt_file"
+      cat "$pf" >> "$prompt_file"
+
+      local of ef
+      of=$(mktemp); ef=$(mktemp)
+      TEMP_FILES+=("$of" "$ef")
+      _out["$config"]="$of"
+      _err["$config"]="$ef"
+
+      call_model "$provider" "$model" "$prompt_file" "$of" "$ef" &
+      _pids+=($!)
+    done
+    for pid in "${_pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+
+    # Print results table
+    echo "| Model | Verdict | Issues | Effort | Time |"
+    echo "|-------|---------|--------|--------|------|"
+
+    local results_for_overlap=()
+    for config in "${configs[@]}"; do
+      local of="${_out[$config]:-}"
+      [[ -z "$of" || ! -f "$of" ]] && continue
+      local result
+      result=$(cat "$of")
+
+      local summary verdict issues effort ms model_name
+      summary=$(printf '%s' "$result" | jq -r '.summary // "[no summary]"' 2>/dev/null)
+      verdict=$(printf '%s' "$result" | jq -r '.verdict // "comment"' 2>/dev/null)
+      issues=$(printf '%s' "$result" | jq '.issues | length' 2>/dev/null || echo "?")
+      effort=$(printf '%s' "$result" | jq -r '.review_effort // "?"' 2>/dev/null)
+      ms=$(printf '%s' "$result" | jq -r '._elapsed_ms // 0' 2>/dev/null)
+      model_name=$(printf '%s' "$result" | jq -r '._model // "?"' 2>/dev/null)
+      local elapsed_s=$(( ms / 1000 ))
+
+      echo "| \`${model_name}\` | ${verdict} | ${issues} | ${effort}/5 | ${elapsed_s}s |"
+
+      # Store for detailed output
+      results_for_overlap+=("$(printf '%s' "$result" | jq -c --arg cfg "$config" '{config: $cfg, result: .}')")
+
+      if [[ "$issues" -gt 0 && "$issues" != "?" ]]; then
+        echo ""
+        echo "**${model_name} summary:** ${summary}"
+        echo ""
+        printf '%s' "$result" | jq -r '.issues[] | "- **[\(.severity)]** `\(.file):\(.line)`: \(.message)"' 2>/dev/null | head -10
+        echo ""
+      fi
+    done
+
+    # Overlap analysis
+    if [[ ${#results_for_overlap[@]} -gt 1 ]]; then
+      local overlap_input
+      overlap_input=$(printf '%s\n' "${results_for_overlap[@]}" | jq -sc '.')
+      local overlap_report
+      overlap_report=$(printf '%s' "$overlap_input" | analyze_overlap 2>/dev/null || true)
+      if [[ -n "$overlap_report" ]]; then
+        echo "$overlap_report"
+      fi
+    fi
+
+    # Append to JSON output
+    if [[ -n "$OUTPUT_FILE" ]]; then
+      printf '%s\n' "${results_for_overlap[@]}" | jq -sc \
+        --arg pr "$pr" --arg ptype "$ptype" \
+        '{pr: $pr, prompt_type: $ptype, results: .}' >> "${OUTPUT_FILE}.tmp" 2>/dev/null || true
+    fi
+  done
+
+  echo ""
+  echo "---"
+}
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+main() {
+  local pr_numbers=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --prompt)             PROMPT_TYPES="$2";       shift 2 ;;
+      --output)             OUTPUT_FILE="$2";        shift 2 ;;
+      --gemini-models)      GEMINI_MODELS="$2";      shift 2 ;;
+      --openai-models)      OPENAI_MODELS="$2";      shift 2 ;;
+      --gemini-full-context) GEMINI_FULL_CONTEXT=true; shift ;;
+      *)                    pr_numbers+=("$1");       shift ;;
+    esac
+  done
+
+  if [[ ${#pr_numbers[@]} -eq 0 ]]; then
+    err "Usage: compare-reviewers [--prompt correctness|security|complexity|all] [--output FILE.json] [--gemini-full-context] PR# ..."
+    exit 1
+  fi
+
+  check_deps claude gh jq python3
+
+  [[ -n "$OUTPUT_FILE" ]] && rm -f "${OUTPUT_FILE}.tmp"
+
+  echo "# Multi-Model Reviewer Comparison"
+  echo ""
+  echo "**Date:** $(date -u '+%Y-%m-%d')"
+  echo "**Prompts:** ${PROMPT_TYPES}"
+  echo "**Gemini models:** ${GEMINI_MODELS}"
+  echo "**OpenAI models:** ${OPENAI_MODELS}"
+  echo "**Gemini full context:** ${GEMINI_FULL_CONTEXT}"
+  echo ""
+
+  for pr in "${pr_numbers[@]}"; do
+    compare_pr "$pr"
+  done
+
+  # Finalize JSON output
+  if [[ -n "$OUTPUT_FILE" && -f "${OUTPUT_FILE}.tmp" ]]; then
+    jq -sc '.' "${OUTPUT_FILE}.tmp" > "$OUTPUT_FILE" 2>/dev/null || \
+      mv "${OUTPUT_FILE}.tmp" "$OUTPUT_FILE"
+    rm -f "${OUTPUT_FILE}.tmp"
+    info "Results written to $OUTPUT_FILE"
+  fi
+
+  info "Done."
+}
+
+trap cleanup_temp EXIT
+
+main "$@"

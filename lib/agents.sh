@@ -60,6 +60,11 @@ load_agent() {
   body="${body//\{\{LANE_IMAGE\}\}/${LANE_IMAGE}}"
   body="${body//\{\{LANE_WORKTREES_DIR\}\}/${LANE_WORKTREES_DIR}}"
   body="${body//\{\{HYGIENE_MAX_RULES_LINES\}\}/${HYGIENE_MAX_RULES_LINES}}"
+  # Issues mode substitutions (fall through as empty string if not set)
+  body="${body//\{\{RELAY_SOURCE\}\}/${RELAY_SOURCE:-tasks_file}}"
+  body="${body//\{\{RELAY_MILESTONE\}\}/${RELAY_MILESTONE:-}}"
+  body="${body//\{\{TASKS_JSON\}\}/${TASKS_JSON:-.relay-tasks.json}}"
+  body="${body//\{\{TASK_BODY\}\}/${TASK_BODY_CONTENT:-}}"
 
   printf '%s' "$body"
 }

@@ -6,8 +6,8 @@
 # inside the lane and keep going.
 #
 # Usage:
-#   lane start <name> [branch]   # create worktree + start container
-#   lane start <name> --clone    # full git clone (supports Agent worktree isolation)
+#   lane start <name> [branch]      # full git clone (default, supports Agent worktree isolation)
+#   lane start <name> --worktree    # use git worktree instead of clone (lighter, shared .git)
 #   lane open <name> [branch]    # start + attach in one step (most common)
 #   lane restart <name>           # stop, remove, and restart container (worktree kept)
 #   lane attach <name>            # attach a shell (then run: claude)
@@ -125,19 +125,21 @@ require_image() {
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 cmd_start() {
-  local name="${1:-}" branch="${2:-}" use_clone=false
-  # Check for --clone flag in any position
+  local name="${1:-}" branch="${2:-}" use_clone=true
+  # Check for --worktree or deprecated --clone flag in any position
   local args=()
   for arg in "$@"; do
-    if [[ "$arg" == "--clone" ]]; then
-      use_clone=true
+    if [[ "$arg" == "--worktree" ]]; then
+      use_clone=false
+    elif [[ "$arg" == "--clone" ]]; then
+      echo "⚠  --clone is now the default and will be removed in a future version"
     else
       args+=("$arg")
     fi
   done
   name="${args[0]:-}"
   branch="${args[1]:-}"
-  [[ -z "$name" ]] && die "Usage: lane start <name> [branch] [--clone]"
+  [[ -z "$name" ]] && die "Usage: lane start <name> [branch] [--worktree]"
 
   resolve_github_token || true  # warn but don't abort
   resolve_claude_token || true  # warn but don't abort
@@ -156,17 +158,26 @@ cmd_start() {
   mkdir -p "$WORKTREES_DIR"
   if [[ -d "$worktree" ]]; then
     if [[ -d "${worktree}/.git" ]]; then
+      # .git is a directory → this is a clone
       if $use_clone; then
         echo "✓ Clone already exists: $worktree"
       else
         die "Lane '$name' looks like a git clone, not a worktree (.git is a directory).
-   This will cause merge conflicts. Fix it:
+   Fix it:
      lane rm $name
-     lane start $name
-   Or use --clone if you want a full clone."
+     lane start $name --worktree"
       fi
     else
-      echo "✓ Worktree already exists: $worktree"
+      # .git is a file → this is a worktree
+      if $use_clone; then
+        die "Lane '$name' is a git worktree, not a clone (.git is a file).
+   Fix it:
+     lane rm $name
+     lane start $name
+   Or use --worktree to keep worktree mode."
+      else
+        echo "✓ Worktree already exists: $worktree"
+      fi
       if ! grep -q '^gitdir:' "${worktree}/.git" 2>/dev/null; then
         die "Lane '$name' has a malformed .git pointer. Fix it:
    lane rm $name && lane start $name"

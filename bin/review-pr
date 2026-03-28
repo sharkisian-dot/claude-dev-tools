@@ -409,16 +409,64 @@ run_review() {
 # ── Post commit status to GitHub ─────────────────────────────────────────────
 
 post_commit_status() {
-  local state=$1 description=$2
+  local state=$1 description=$2 context=${3:-"PR Review Gate"}
   [[ -z "${PR_NUMBER:-}" ]] && return  # not a PR run, skip
   local sha
   sha=$(gh pr view "$PR_NUMBER" --json headRefOid -q .headRefOid 2>/dev/null) || return
   [[ -z "$sha" ]] && return
   gh api "repos/{owner}/{repo}/statuses/$sha" \
     -f state="$state" \
-    -f context="PR Review Gate" \
+    -f context="$context" \
     -f description="$description" \
     --silent 2>/dev/null || true
+}
+
+# ── Run TypeScript type check ─────────────────────────────────────────────────
+
+run_type_check() {
+  [[ -z "${PR_NUMBER:-}" ]] && return
+  local changed_files
+  changed_files=$(git diff --name-only origin/main...HEAD 2>/dev/null) || changed_files=""
+  if ! printf '%s\n' "$changed_files" | grep -qE '\.(ts|tsx)$'; then
+    post_commit_status "success" "No TS files changed — skipped" "Type Check"
+    return
+  fi
+  info "Running type check..."
+  local tsc_output tsc_exit
+  tsc_output=$(npx tsc --noEmit --project tsconfig.build.json 2>&1) || tsc_exit=$?
+  tsc_exit=${tsc_exit:-0}
+  if [[ $tsc_exit -eq 0 ]]; then
+    post_commit_status "success" "Type check passed" "Type Check"
+    info "Type check: passed"
+  else
+    local error_count
+    error_count=$(printf '%s\n' "$tsc_output" | grep -c ' error TS' 2>/dev/null || echo "?")
+    post_commit_status "failure" "Type check failed (${error_count} errors)" "Type Check"
+    info "Type check: failed (${error_count} errors)"
+  fi
+}
+
+# ── Run test suite ────────────────────────────────────────────────────────────
+
+run_test_suite() {
+  [[ -z "${PR_NUMBER:-}" ]] && return
+  local changed_files
+  changed_files=$(git diff --name-only origin/main...HEAD 2>/dev/null) || changed_files=""
+  if ! printf '%s\n' "$changed_files" | grep -qE '^src/'; then
+    post_commit_status "success" "No src/ changes — skipped" "Test Suite"
+    return
+  fi
+  info "Running test suite..."
+  local test_exit
+  npx vitest run 2>&1 || test_exit=$?
+  test_exit=${test_exit:-0}
+  if [[ $test_exit -eq 0 ]]; then
+    post_commit_status "success" "All tests passed" "Test Suite"
+    info "Test suite: passed"
+  else
+    post_commit_status "failure" "Tests failed" "Test Suite"
+    info "Test suite: failed"
+  fi
 }
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -494,6 +542,8 @@ ${OUTPUT_FORMAT}"
 
     # Post pending status before reviewers run
     post_commit_status "pending" "Reviewers running…"
+    post_commit_status "pending" "Type check pending…" "Type Check"
+    post_commit_status "pending" "Test suite pending…" "Test Suite"
 
     # Run all reviewers in parallel
     local pids=()
@@ -527,6 +577,10 @@ ${OUTPUT_FORMAT}"
     for pid in "${pids[@]}"; do
       wait "$pid" 2>/dev/null || true
     done
+
+    # Run type check and test suite after reviewers complete
+    run_type_check
+    run_test_suite
 
     # Aggregate verdicts from temp files written by run_review subprocesses
     # Severity-based: only [critical] issues trigger failure; [warning] issues become GitHub issues

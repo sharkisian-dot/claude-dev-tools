@@ -108,7 +108,7 @@ tasks_json=$(echo "$issue_data" | jq '
     status: (if .state == "CLOSED" then "done" else "pending" end),
     depends_on: (
       (.body // "") |
-      capture("\\*\\*Depends on:\\*\\*[[:space:]]*(?P<deps>[^\\n]+)") |
+      capture("\\*\\*Depends on:\\*\\*[[:space:]]*(?<deps>[^\\n]+)") |
       if . == null then []
       else
         .deps |
@@ -125,9 +125,9 @@ tasks_json=$(echo "$issue_data" | jq '
 
 # Build final tasks.json
 jq -nc \
-  --arg label "$MILESTONE" \
+  --arg milestone "$MILESTONE" \
   --argjson tasks "$tasks_json" \
-  '{"relay_label": $label, "source": "issues", "tasks": $tasks}' \
+  '{"relay_label": $milestone, "source": "issues", "tasks": $tasks}' \
   > "$OUTPUT_FILE"
 
 task_count=$(echo "$tasks_json" | jq 'length')

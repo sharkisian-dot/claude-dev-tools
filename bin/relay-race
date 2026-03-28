@@ -488,6 +488,71 @@ mark_blocked() {
 }
 
 # ── DRY-RUN: show execution plan ──────────────────────────────────────────────
+_issues_dry_run_plan() {
+  local vdone_str="" wave=1 total=0
+  mapfile -t _all_ids < <(jq -r '.tasks[] | select(.status == "pending") | .id' "$TASKS_JSON" 2>/dev/null)
+
+  while true; do
+    local wave_tasks=()
+    for tid in "${_all_ids[@]}"; do
+      echo " $vdone_str " | grep -q " $tid " && continue
+      local _deps _satisfied=true
+      _deps=$(jq -r --arg id "$tid" '.tasks[] | select(.id == $id) | .depends_on[]?' "$TASKS_JSON" 2>/dev/null)
+      while IFS= read -r _dep_num; do
+        [[ -z "$_dep_num" ]] && continue
+        local _dep_id="TASK-${_dep_num}"
+        if ! echo " $vdone_str " | grep -q " $_dep_id "; then
+          local _dep_status
+          _dep_status=$(jq -r --arg id "$_dep_id" '.tasks[] | select(.id == $id) | .status' "$TASKS_JSON" 2>/dev/null)
+          [[ "$_dep_status" == "done" ]] || { _satisfied=false; break; }
+        fi
+      done <<< "$_deps"
+      $_satisfied || continue
+      local _model
+      _model=$(jq -r --arg id "$tid" '.tasks[] | select(.id == $id) | .model' "$TASKS_JSON" 2>/dev/null)
+      wave_tasks+=("$tid|$_model")
+    done
+
+    [[ ${#wave_tasks[@]} -eq 0 ]] && break
+
+    echo ""
+    if (( ${#wave_tasks[@]} > MAX_PARALLEL )); then
+      echo "Wave $wave  (${#wave_tasks[@]} ready, ${MAX_PARALLEL} slots — rest spill to next wave):"
+    else
+      echo "Wave $wave  (${#wave_tasks[@]} in parallel):"
+    fi
+
+    local slot=0
+    for _entry in "${wave_tasks[@]}"; do
+      local tid="${_entry%%|*}" _model="${_entry#*|}"
+      local _dep_list
+      _dep_list=$(jq -r --arg id "$tid" '.tasks[] | select(.id == $id) | .depends_on[]? | "TASK-\(.)"' "$TASKS_JSON" 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+      if (( slot < MAX_PARALLEL )); then
+        echo "  [$tid] ($_model)$( [[ -n "$_dep_list" ]] && echo " ← needs: $_dep_list")"
+      else
+        echo "  [$tid] ($_model) ← spills to wave $((wave+1))"
+      fi
+      vdone_str="$vdone_str $tid"
+      (( total++ )) || true; (( slot++ )) || true
+    done
+    (( wave++ )) || true
+  done
+
+  local _dep_blocked=0
+  for tid in "${_all_ids[@]}"; do
+    echo " $vdone_str " | grep -q " $tid " && continue
+    (( _dep_blocked++ )) || true
+    local _dep_list
+    _dep_list=$(jq -r --arg id "$tid" '.tasks[] | select(.id == $id) | .depends_on[]? | "TASK-\(.)"' "$TASKS_JSON" 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+    echo "  ⛔ [$tid] dep-blocked — needs: ${_dep_list:-none}"
+  done
+
+  echo ""
+  local _blocked_note=""
+  (( _dep_blocked > 0 )) && _blocked_note=", $_dep_blocked dep-blocked"
+  echo "Total: $total tasks across $((wave - 1)) wave(s)${_blocked_note}"
+}
+
 show_dry_run_plan() {
   local vdone_str=""   # space-separated IDs of virtually completed tasks
   local wave=1
@@ -495,6 +560,10 @@ show_dry_run_plan() {
 
   echo "📋 Execution plan (--parallel ${MAX_PARALLEL}):"
   [[ "$STRICT_CONFLICTS" == true ]] && echo "   conflict mode: strict (serialize on file overlap)"
+
+  if [[ "$RELAY_SOURCE" == "issues" ]]; then
+    _issues_dry_run_plan
+  else
 
   while true; do
     # Find all tasks runnable in this wave
@@ -565,6 +634,8 @@ show_dry_run_plan() {
   (( scout_blocked > 0 )) && blocked_note="${blocked_note}, $scout_blocked scout-blocked"
   echo "Total: $total tasks across $((wave - 1)) wave(s)${blocked_note}"
 
+  fi  # end else (TASKS.md mode)
+
   if [[ "$SKIP_STATIC_ANALYSIS" != true ]] && [[ -n "$STATIC_ANALYSIS_TYPECHECK" || -n "$STATIC_ANALYSIS_LINT" || -n "$STATIC_ANALYSIS_FORMAT" ]]; then
     echo ""
     echo "  [STATIC ANALYSIS] (deterministic) ← lint/typecheck/format on changed files"
@@ -588,8 +659,26 @@ show_dry_run_plan() {
 }
 
 if [[ "$DRY_RUN" == true ]]; then
+  # In issues mode, hydrate tasks.json before displaying the plan
+  if [[ "$RELAY_SOURCE" == "issues" && ! -f "$TASKS_JSON" ]]; then
+    _hydrate_bin="${DEVTOOLS_ROOT}/bin/hydrate-tasks"
+    if [[ -x "$_hydrate_bin" ]]; then
+      if [[ -n "$RELAY_MILESTONE" ]]; then
+        "$_hydrate_bin" --milestone "$RELAY_MILESTONE" --output "$TASKS_JSON"
+      else
+        "$_hydrate_bin" --output "$TASKS_JSON"
+        RELAY_MILESTONE=$(jq -r '.relay_label' "$TASKS_JSON" 2>/dev/null || echo "")
+      fi
+    fi
+  elif [[ "$RELAY_SOURCE" == "issues" && -f "$TASKS_JSON" && -z "$RELAY_MILESTONE" ]]; then
+    RELAY_MILESTONE=$(jq -r '.relay_label' "$TASKS_JSON" 2>/dev/null || echo "")
+  fi
   echo "🏁 Parallel Relay Race (DRY RUN)"
-  echo "   parallel: ${MAX_PARALLEL}  |  file: ${TASKS_FILE}"
+  if [[ "$RELAY_SOURCE" == "issues" ]]; then
+    echo "   parallel: ${MAX_PARALLEL}  |  issues: ${RELAY_MILESTONE}  |  file: ${TASKS_JSON}"
+  else
+    echo "   parallel: ${MAX_PARALLEL}  |  file: ${TASKS_FILE}"
+  fi
   echo ""
   show_dry_run_plan
   exit 0

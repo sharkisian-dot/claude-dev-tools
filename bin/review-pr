@@ -384,9 +384,24 @@ run_review() {
       -p "Respond with ONLY a JSON object, no markdown fences." \
       < "$prompt_file" \
       2>"$review_stderr") || {
-        err "${reviewer_name} review failed for PR #${pr}:"
-        cat "$review_stderr" >&2
-        return 1
+        # If CLI fails and GOOGLE_API_KEY is set, fall back to API
+        if [[ -n "${GOOGLE_API_KEY:-}" ]]; then
+          err "${reviewer_name}: Gemini CLI failed — falling back to API"
+          review_stderr=$(mktemp); TEMP_FILES+=("$review_stderr")
+          review_output=$(python3 "${DEVTOOLS_ROOT}/lib/call-model.py" \
+            --provider "gemini" \
+            --model "$model" \
+            < "$prompt_file" \
+            2>"$review_stderr") || {
+              err "${reviewer_name} review failed for PR #${pr} (API fallback):"
+              cat "$review_stderr" >&2
+              return 1
+            }
+        else
+          err "${reviewer_name} review failed for PR #${pr}:"
+          cat "$review_stderr" >&2
+          return 1
+        fi
       }
   elif [[ "$provider" == "gemini" || "$provider" == "openai" ]]; then
     review_output=$(python3 "${DEVTOOLS_ROOT}/lib/call-model.py" \

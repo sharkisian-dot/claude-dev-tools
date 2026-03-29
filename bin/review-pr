@@ -471,7 +471,7 @@ run_type_check() {
     return
   fi
   info "Running type check..."
-  wait_for_ram 1500 "tsc"
+  wait_for_ram "tsc"
   local tsc_output tsc_exit
   tsc_output=$(npx tsc --noEmit --project tsconfig.build.json 2>&1) || tsc_exit=$?
   tsc_exit=${tsc_exit:-0}
@@ -626,35 +626,35 @@ ${OUTPUT_FORMAT}"
     post_commit_status "pending" "Test suite pending…" "Test Suite"
 
     # ── Round 1: Claude reviewers (always run) ───────────────────────────────
-    # Each reviewer requires ~2GB free. wait_for_ram ensures reviewers don't
-    # all launch simultaneously when RAM is already constrained by other gates.
+    # wait_for_ram stalls each launch until kernel memory pressure is normal,
+    # preventing reviewers from all launching simultaneously under RAM stress.
     local pids=()
     local reviewer_names=("Sonnet" "Opus Architect")
 
-    wait_for_ram 2000 "Sonnet reviewer"
+    wait_for_ram "Sonnet reviewer"
     run_review "$pr" "$REVIEW_PROMPT" "sonnet" "Sonnet" "$context_file" &
     pids+=($!)
 
-    wait_for_ram 2000 "Opus Architect reviewer"
+    wait_for_ram "Opus Architect reviewer"
     run_review "$pr" "$OPUS_PROMPT" "opus" "Opus Architect" "$context_file" 2 &
     pids+=($!)
 
     if [[ "$SKIP_TEST_COVERAGE" != "true" ]]; then
-      wait_for_ram 2000 "Test Coverage reviewer"
+      wait_for_ram "Test Coverage reviewer"
       run_review "$pr" "$TEST_COVERAGE_PROMPT" "sonnet" "Test Coverage" "$context_file" &
       pids+=($!)
       reviewer_names+=("Test Coverage")
     fi
 
     if [[ "$SKIP_FILE_ORG" != "true" ]]; then
-      wait_for_ram 2000 "File Organization reviewer"
+      wait_for_ram "File Organization reviewer"
       run_review "$pr" "$FILE_ORG_PROMPT" "sonnet" "File Organization" "$context_file" &
       pids+=($!)
       reviewer_names+=("File Organization")
     fi
 
     if [[ "$SKIP_SECURITY" != "true" ]]; then
-      wait_for_ram 2000 "Security reviewer"
+      wait_for_ram "Security reviewer"
       run_review "$pr" "$SECURITY_PROMPT" "sonnet" "Security" "$context_file" &
       pids+=($!)
       reviewer_names+=("Security")

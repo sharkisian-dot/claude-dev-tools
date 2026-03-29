@@ -887,6 +887,7 @@ run_static_analysis_gate() {
   # Step 3: Type check (if configured) — fails the gate on errors
   if [[ -n "$STATIC_ANALYSIS_TYPECHECK" ]]; then
     echo "  🔍 Type checking..."
+    wait_for_ram 1500 "tsc"
     local typecheck_output; typecheck_output=$(mktemp)
     if _run_cmd "$STATIC_ANALYSIS_TYPECHECK" > "$typecheck_output" 2>&1; then
       echo "  ✓ Type check passed"
@@ -1254,6 +1255,7 @@ while true; do
           local_desc=$(echo "$local_task_line" | sed 's/- \[ \] //' | cut -c1-72)
           do_commit "${local_task_id}: $local_desc"
           if [[ "$SKIP_TEST_REVIEW_GATE" != true || "$SKIP_SIMPLIFY_GATE" != true ]]; then
+            wait_for_ram 2000 "[${local_task_id}] gate pair"
             (
               [[ "$SKIP_TEST_REVIEW_GATE" != true ]] && run_task_test_review "$local_task_id"
               [[ "$SKIP_SIMPLIFY_GATE" != true ]]    && run_simplify_gate "$local_task_id"

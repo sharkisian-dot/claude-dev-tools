@@ -6,6 +6,7 @@ Uses Claude Code CLI (`claude -p`) for agent execution.
 ## Overview
 
 This repo provides reusable scripts for:
+
 - **relay-race** — Parallel multi-agent task execution with quality gates
 - **review-pr** — 5-reviewer parallel PR review (correctness, complexity, test coverage, file org, security)
 - **fix-loop** — Automated PR review + fix + re-review loop
@@ -30,34 +31,34 @@ Projects override agents by placing files in `.devtools/agents/` with the same n
 
 ## Multi-Model Strategy
 
-| Role | Model | Script |
-|---|---|---|
-| Correctness reviewer | Sonnet | review-pr, fix-loop |
-| Complexity reviewer | Opus | review-pr, fix-loop |
-| Test coverage reviewer | Sonnet | review-pr, fix-loop |
-| File org reviewer | Sonnet | review-pr, fix-loop |
-| Security reviewer | Sonnet | review-pr, fix-loop |
-| Meta-reviewer | Sonnet | fix-loop |
-| Code fixer | Sonnet | fix-loop |
-| Task runner | Haiku/Sonnet/Opus (per task tag) | relay-race |
-| Static analysis gate | None (deterministic) | relay-race |
-| Test reviewer gate | Sonnet | relay-race |
-| Code simplifier gate | Haiku | relay-race |
-| Hygiene gate | Haiku | relay-race |
-| Review gate | Opus | relay-race |
-| Visual critique gate | Sonnet | relay-race |
-| Planning agent | Opus | opus-plan |
+| Role                   | Model                            | Script              |
+| ---------------------- | -------------------------------- | ------------------- |
+| Correctness reviewer   | Sonnet                           | review-pr, fix-loop |
+| Complexity reviewer    | Opus                             | review-pr, fix-loop |
+| Test coverage reviewer | Sonnet                           | review-pr, fix-loop |
+| File org reviewer      | Sonnet                           | review-pr, fix-loop |
+| Security reviewer      | Sonnet                           | review-pr, fix-loop |
+| Meta-reviewer          | Sonnet                           | fix-loop            |
+| Code fixer             | Sonnet                           | fix-loop            |
+| Task runner            | Haiku/Sonnet/Opus (per task tag) | relay-race          |
+| Static analysis gate   | None (deterministic)             | relay-race          |
+| Test reviewer gate     | Sonnet                           | relay-race          |
+| Code simplifier gate   | Haiku                            | relay-race          |
+| Hygiene gate           | Haiku                            | relay-race          |
+| Review gate            | Opus                             | relay-race          |
+| Visual critique gate   | Sonnet                           | relay-race          |
+| Planning agent         | Opus                             | opus-plan           |
 
 ## TASKS.md Format
 
 ```markdown
 - [ ] **Task AG-1: [sonnet] Short title**
-  Description and acceptance criteria.
+      Description and acceptance criteria.
   - Criterion 1
   - Criterion 2
 
 - [ ] **Task AG-2: [haiku] Depends on AG-1** [needs: AG-1]
-  Won't start until AG-1 is done.
+      Won't start until AG-1 is done.
 ```
 
 Tags: `[haiku]`, `[sonnet]`, `[opus]` — determines which model runs the task.
@@ -86,6 +87,7 @@ devtools review-pr --incremental 42  # only new commits since last review
 devtools review-pr --skip-security 42  # skip security reviewer
 devtools review-pr --skip-test-coverage 42  # skip test coverage reviewer
 devtools review-pr --approve 42      # auto-approve if clean
+devtools review-pr --restamp 42      # re-run tsc+vitest only after rebase (no AI review)
 ```
 
 ## Quality Gates (relay-race)

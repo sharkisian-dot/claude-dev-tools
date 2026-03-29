@@ -158,6 +158,61 @@ check_pr_size() {
   return 0
 }
 
+# ── RAM-aware concurrency gate ────────────────────────────────────────────────
+#
+# memory_pressure_level: 0=normal, 1=warning, 2=critical (macOS); always 0 on Linux.
+# Uses sysctl vm.memory_pressure — the kernel's own assessment of memory stress.
+memory_pressure_level() {
+  if [[ "$(uname)" == "Darwin" ]]; then
+    sysctl -n vm.memory_pressure 2>/dev/null || echo 0
+  else
+    echo 0
+  fi
+}
+
+# available_ram_mb: free + inactive pages — used for logging/diagnostics only.
+# macOS keeps free pages near zero intentionally (file cache lives in inactive),
+# so this is a rough estimate, not a reliable gate signal.
+available_ram_mb() {
+  if [[ "$(uname)" == "Darwin" ]]; then
+    local page_size; page_size=$(sysctl -n hw.pagesize)
+    vm_stat | awk -v ps="$page_size" '
+      /Pages free/     { free=$3 }
+      /Pages inactive/ { inact=$3 }
+      END { printf "%d", (free + inact) * ps / 1024 / 1024 }
+    ' | tr -d '.'
+  else
+    awk '/MemAvailable/ { printf "%d", $2 / 1024; exit }' /proc/meminfo
+  fi
+}
+
+# wait_for_ram [label] [timeout_s]
+# Blocks until the kernel reports normal memory pressure (vm.memory_pressure=0).
+# Gate is pressure-only: free-page counts are unreliable on macOS because the OS
+# keeps free pages near zero by design. Times out after timeout_s (default 600s)
+# with a warning rather than hanging indefinitely.
+wait_for_ram() {
+  local label="${1:-process}"
+  local timeout_s="${2:-600}"
+  local waited=false
+  local elapsed=0
+  while (( $(memory_pressure_level) > 0 )); do
+    if [[ "$waited" == false ]]; then
+      log "⏳ Waiting for memory pressure to clear before launching ${label} (pressure=$(memory_pressure_level), ~$(available_ram_mb)MB estimated free)..."
+      waited=true
+    fi
+    if (( elapsed >= timeout_s )); then
+      log "⚠️  RAM wait timed out after ${timeout_s}s — launching ${label} anyway (pressure=$(memory_pressure_level))"
+      return 0
+    fi
+    sleep 5
+    (( elapsed += 5 )) || true
+  done
+  if [[ "$waited" == true ]]; then
+    log "✅ Memory pressure cleared — launching ${label} (~$(available_ram_mb)MB estimated free)"
+  fi
+}
+
 duration_log_summary() {
   [[ -z "$DURATION_LOG_FILE" || ! -f "$DURATION_LOG_FILE" ]] && return
   local total_duration=0 entry_count=0

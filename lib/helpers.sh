@@ -197,7 +197,9 @@ wait_for_ram() {
     fi
     sleep 5
   done
-  [[ "$waited" == true ]] && log "✅ RAM clear (pressure=$(memory_pressure_level), free=$(available_ram_mb)MB) — launching ${label}"
+  if [[ "$waited" == true ]]; then
+    log "✅ RAM clear (pressure=$(memory_pressure_level), free=$(available_ram_mb)MB) — launching ${label}"
+  fi
 }
 
 duration_log_summary() {

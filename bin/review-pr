@@ -24,7 +24,7 @@
 #   3. Sonnet test coverage — missing tests for changed code
 #   4. Sonnet file organization — structural problems, repo hygiene
 #   5. Sonnet security — vulnerabilities, secrets, auth, injection
-#   6. Gemini 3.1 Pro — auto-enabled when GOOGLE_API_KEY is set (--skip-gemini to disable)
+#   6. Gemini 2.5 Pro — auto-enabled when GOOGLE_API_KEY is set (--skip-gemini to disable)
 #   7. GPT-5.4 — auto-enabled when OPENAI_API_KEY is set (--skip-openai to disable)
 #
 # Requires: claude CLI (authenticated), gh CLI (authenticated)
@@ -63,7 +63,7 @@ USE_GEMINI="${USE_GEMINI:-false}"
 USE_OPENAI="${USE_OPENAI:-false}"
 SKIP_GEMINI="${SKIP_GEMINI:-false}"
 SKIP_OPENAI="${SKIP_OPENAI:-false}"
-GEMINI_MODEL="${GEMINI_MODEL:-gemini-3.1-pro-preview}"
+GEMINI_MODEL="${GEMINI_MODEL:-gemini-2.5-pro}"
 OPENAI_MODEL="${OPENAI_MODEL:-gpt-5.4-2026-03-05}"
 PR_NUMBER="${PR_NUMBER:-}"
 MAX_DIFF_LINES="${MAX_DIFF_LINES:-800}"

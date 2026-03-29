@@ -13,7 +13,7 @@
 #   relay-race                  # sequential, creates PR (default)
 #   relay-race --parallel 3     # up to 3 concurrent agents
 #   relay-race --no-pr          # commit to current branch, no PR
-#   relay-race --parallel 3 --gemini  # Gemini primary (default: gemini-3.1-pro-preview)
+#   relay-race --parallel 3 --gemini  # Gemini primary (default: gemini-2.5-pro)
 #   relay-race --parallel 3 --gemini --gemini-model gemini-2.5-pro  # specific model
 #   relay-race --dry-run        # show execution plan
 #   relay-race --max 10         # cap total tasks
@@ -45,7 +45,7 @@ MAX_PARALLEL=1
 MAX_TASKS=999
 DRY_RUN=false
 USE_GEMINI=false
-GEMINI_MODEL="gemini-3.1-pro-preview"
+GEMINI_MODEL="gemini-2.5-pro"
 SKIP_REVIEW_GATE=false
 SKIP_CRITIQUE_GATE=false
 SKIP_TEST_REVIEW_GATE=false

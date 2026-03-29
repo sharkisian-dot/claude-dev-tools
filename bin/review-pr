@@ -12,6 +12,7 @@
 #   devtools review-pr --incremental 18         # only review new commits since last review
 #   devtools review-pr --max-diff-lines 1200 18 # adjust max diff line threshold
 #   devtools review-pr --force 18              # review even if diff exceeds limit
+#   devtools review-pr --restamp 18             # re-run tsc+vitest and stamp statuses (no AI review)
 #   devtools review-pr --skip-gemini 18        # disable Gemini even if GOOGLE_API_KEY is set
 #   devtools review-pr --skip-openai 18        # disable OpenAI even if OPENAI_API_KEY is set
 #   devtools review-pr --gemini-model gemini-2.5-flash 18
@@ -67,6 +68,7 @@ OPENAI_MODEL="${OPENAI_MODEL:-gpt-5.4-2026-03-05}"
 PR_NUMBER="${PR_NUMBER:-}"
 MAX_DIFF_LINES="${MAX_DIFF_LINES:-800}"
 FORCE_REVIEW="${FORCE_REVIEW:-false}"
+RESTAMP="${RESTAMP:-false}"
 
 # ── Shared JSON output format for review prompts ────────────────────────────
 
@@ -534,6 +536,103 @@ if total > 20.0:
 PYEOF
 }
 
+# ── Restamp: re-run deterministic checks after rebase ────────────────────────
+#
+# When a PR that already passed all 3 statuses gets rebased, the new HEAD SHA
+# has no statuses. --restamp verifies the prior SHA had all 3 passing, re-runs
+# tsc + vitest, and stamps the new SHA. No AI reviewers run.
+
+restamp_pr() {
+  local pr="$1"
+  check_deps gh jq
+
+  local head_sha
+  head_sha=$(gh pr view "$pr" --json headRefOid -q .headRefOid 2>/dev/null)
+  [[ -z "$head_sha" ]] && { err "Could not get HEAD SHA for PR #${pr}"; return 1; }
+
+  # Find the previous SHA by looking at the status history.
+  # The most recent status on ANY sha other than current HEAD is the prior SHA.
+  local required_contexts=("PR Review Gate" "Type Check" "Test Suite")
+  local prior_sha=""
+
+  # Get all statuses for the PR's head ref — GitHub returns statuses for the
+  # current SHA only via the combined endpoint, but we need the prior SHA.
+  # Use the events timeline to find the previous head SHA.
+  local prev_sha
+  prev_sha=$(gh api "repos/{owner}/{repo}/pulls/${pr}/events" \
+    --jq '[.[] | select(.event == "head_ref_force_pushed") | .before] | last // empty' 2>/dev/null)
+
+  if [[ -z "$prev_sha" ]]; then
+    # Fallback: check the devtools review marker comments for the last reviewed SHA
+    prev_sha=$(gh api "repos/{owner}/{repo}/issues/${pr}/comments" \
+      --jq '[.[] | select(.body | startswith("<!-- devtools-reviewed:")) | .body | capture("<!-- devtools-reviewed:(?<sha>[a-f0-9]+) -->") | .sha] | last // empty' 2>/dev/null)
+  fi
+
+  if [[ -z "$prev_sha" ]]; then
+    err "No previous SHA found for PR #${pr} — cannot verify prior statuses."
+    err "This PR may not have been reviewed yet. Run a full review instead."
+    return 1
+  fi
+
+  if [[ "$prev_sha" == "$head_sha" ]]; then
+    err "Previous SHA matches current HEAD — no rebase detected. Nothing to restamp."
+    return 1
+  fi
+
+  info "PR #${pr}: Restamping (prior SHA: ${prev_sha:0:7} → current: ${head_sha:0:7})"
+
+  # Verify all 3 statuses were "success" on the prior SHA
+  local combined_state
+  combined_state=$(gh api "repos/{owner}/{repo}/commits/${prev_sha}/status" 2>/dev/null)
+
+  local all_passed=true
+  for ctx in "${required_contexts[@]}"; do
+    local state
+    state=$(printf '%s' "$combined_state" | jq -r --arg ctx "$ctx" \
+      '.statuses[] | select(.context == $ctx) | .state' 2>/dev/null | head -1)
+    if [[ "$state" != "success" ]]; then
+      err "Prior SHA ${prev_sha:0:7} did not have '${ctx}' as success (was: ${state:-missing})"
+      all_passed=false
+    fi
+  done
+
+  if [[ "$all_passed" != "true" ]]; then
+    err "Cannot restamp — prior SHA did not pass all required checks."
+    err "Run a full review instead: review-pr ${pr}"
+    return 1
+  fi
+
+  info "Prior SHA passed all 3 checks. Running deterministic checks on new HEAD..."
+
+  # Checkout the PR branch for local checks
+  local head_branch
+  head_branch=$(gh pr view "$pr" --json headRefName -q .headRefName 2>/dev/null)
+  git fetch origin "$head_branch" 2>/dev/null
+  git checkout "$head_branch" 2>/dev/null || git checkout "origin/$head_branch" --detach 2>/dev/null
+
+  # Run type check
+  PR_NUMBER="$pr" run_type_check
+
+  # Run test suite
+  PR_NUMBER="$pr" run_test_suite
+
+  # Check if tsc or vitest failed (read back the statuses we just posted)
+  local new_statuses
+  new_statuses=$(gh api "repos/{owner}/{repo}/commits/${head_sha}/status" 2>/dev/null)
+  local tsc_state test_state
+  tsc_state=$(printf '%s' "$new_statuses" | jq -r '.statuses[] | select(.context == "Type Check") | .state' | head -1)
+  test_state=$(printf '%s' "$new_statuses" | jq -r '.statuses[] | select(.context == "Test Suite") | .state' | head -1)
+
+  if [[ "$tsc_state" == "success" && "$test_state" == "success" ]]; then
+    post_commit_status "success" "No critical issues (restamped from ${prev_sha:0:7})" "PR Review Gate"
+    info "PR #${pr}: Restamp complete — all 3 statuses set to success."
+  else
+    post_commit_status "failure" "Deterministic checks failed after rebase" "PR Review Gate"
+    err "PR #${pr}: Restamp failed — rebase introduced breakage. Run a full review."
+    return 1
+  fi
+}
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 main() {
@@ -548,6 +647,7 @@ main() {
       --incremental)         INCREMENTAL=true;          shift ;;
       --max-diff-lines)      MAX_DIFF_LINES="$2";        shift 2 ;;
       --force)               FORCE_REVIEW=true;           shift ;;
+      --restamp)              RESTAMP=true;                shift ;;
       --use-gemini)          USE_GEMINI=true;           shift ;;
       --use-openai)          USE_OPENAI=true;           shift ;;
       --skip-gemini|--skip-antigravity) SKIP_GEMINI=true;  shift ;;
@@ -558,7 +658,19 @@ main() {
     esac
   done
 
-  check_deps claude gh jq
+  check_deps gh jq
+
+  # --restamp: fast path — no AI reviewers needed
+  if [[ "$RESTAMP" == "true" ]]; then
+    if [[ -z "$PR_NUMBER" ]]; then
+      err "--restamp requires a PR number"
+      exit 1
+    fi
+    restamp_pr "$PR_NUMBER"
+    exit $?
+  fi
+
+  check_deps claude
 
   local prs
   prs=$(get_prs)

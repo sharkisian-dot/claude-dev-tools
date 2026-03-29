@@ -13,7 +13,7 @@
 #
 # Models tested:
 #   Claude  Sonnet (baseline, via claude CLI subscription)
-#   Gemini  gemini-2.5-flash, gemini-3.1-pro-preview   (GOOGLE_API_KEY)
+#   Gemini  gemini-2.5-flash, gemini-2.5-pro          (GOOGLE_API_KEY)
 #   OpenAI  gpt-4.1, gpt-5.4-2026-03-05               (OPENAI_API_KEY)
 #
 # Notes:
@@ -38,7 +38,7 @@ MAX_CONTEXT_BYTES="${MAX_CONTEXT_BYTES:-600000}"
 GEMINI_FULL_CONTEXT="${GEMINI_FULL_CONTEXT:-false}"  # skip truncation for Gemini
 
 # Models to test per provider (comma-separated)
-GEMINI_MODELS="${GEMINI_MODELS:-gemini-2.5-flash,gemini-3.1-pro-preview}"
+GEMINI_MODELS="${GEMINI_MODELS:-gemini-2.5-flash,gemini-2.5-pro}"
 OPENAI_MODELS="${OPENAI_MODELS:-gpt-4.1,gpt-5.4-2026-03-05}"
 
 # ── Shared review output format ───────────────────────────────────────────────

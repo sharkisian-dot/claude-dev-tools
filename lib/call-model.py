@@ -19,8 +19,7 @@ import urllib.error
 # ── Cost logging ─────────────────────────────────────────────────────────────
 PRICING: dict[str, tuple[float, float]] = {
     # model: (input_price_per_1M, output_price_per_1M)
-    "gemini-3.1-pro-preview": (1.25, 10.0),
-    "gemini-2.5-pro-preview": (1.25, 10.0),
+    "gemini-2.5-pro": (1.25, 10.0),
     "gemini-2.5-flash": (0.075, 0.30),
     "gemini-2.0-flash": (0.10, 0.40),
     "gpt-5.4-2026-03-05": (2.50, 10.0),
